@@ -44,6 +44,7 @@ func TestSupportedCompletionFormatsRecognized(t *testing.T) {
 			executors: []string{"codex", "home_codex", "xai"},
 			nonEmpty:   []byte("data: {\"type\":\"response.output_text.delta\",\"item_id\":\"1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"output_tokens\":5}}}\n\ndata: [DONE]\n\n"),
 			empty:      []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[],\"usage\":{\"output_tokens\":0}}}\n\ndata: [DONE]\n\n"),
+			neverEmpty: true,
 		},
 		{
 			// Anthropic Claude wire. Emitted by the Claude executor

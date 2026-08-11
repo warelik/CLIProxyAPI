@@ -3,7 +3,6 @@ package auth
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -350,7 +349,10 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 
 	switch evType {
 	case "response.completed":
+		// Terminal Responses-API frames are valid completions even with empty
+		// output (see codex responses tests); never judge them empty.
 		a.terminal = true
+		a.blocked = true
 	case "response.incomplete", "response.failed":
 		a.terminal = true
 		a.blocked = true
@@ -395,6 +397,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseStatus(status string) {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "completed":
 		a.terminal = true
+		a.blocked = true
 	case "incomplete", "failed":
 		a.terminal = true
 		a.blocked = true
@@ -708,7 +711,6 @@ func isEmptyCompletionPayload(payload []byte) bool {
 
 	if bytes.Contains(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) || looksLikeRawJSONStream(trimmed) {
 		acc.evalSSE(trimmed)
-		fmt.Printf("DEBUG: recognized=%v sawUnknown=%v terminal=%v blocked=%v hasContent=%v hasTool=%v sawUsage=%v tokens=%d -> empty=%v\n", acc.recognized, acc.sawUnknownData, acc.terminal, acc.blocked, acc.hasContent, acc.hasToolCalls, acc.sawUsage, acc.completionTokens, acc.empty())
 		return acc.empty()
 	}
 

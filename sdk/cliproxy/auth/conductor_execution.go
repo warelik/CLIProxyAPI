@@ -295,6 +295,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		pickOpts = withExcludedAuthIDs(pickOpts, tried)
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
@@ -564,6 +565,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
+		pickOpts = withExcludedAuthIDs(pickOpts, tried)
 
 		var selection *HomeDispatchSelection
 		var auth *Auth
@@ -787,6 +789,38 @@ func withHomeAuthCount(opts cliproxyexecutor.Options, count int) cliproxyexecuto
 		meta[k] = v
 	}
 	meta[homeAuthCountMetadataKey] = count
+	opts.Metadata = meta
+	return opts
+}
+
+// withExcludedAuthIDs records the request-scoped set of auth IDs that already
+// failed (429/5xx/empty) within the current request so that the selector never
+// re-picks them for the remainder of the request.
+func withExcludedAuthIDs(opts cliproxyexecutor.Options, tried map[string]struct{}) cliproxyexecutor.Options {
+	if len(tried) == 0 {
+		return opts
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	excluded := make(map[string]struct{}, len(tried))
+	for id := range tried {
+		excluded[id] = struct{}{}
+	}
+	if existing, ok := meta[cliproxyexecutor.ExcludedAuthIDsMetadataKey]; ok {
+		switch v := existing.(type) {
+		case map[string]struct{}:
+			for id := range v {
+				excluded[id] = struct{}{}
+			}
+		case []string:
+			for _, id := range v {
+				excluded[id] = struct{}{}
+			}
+		}
+	}
+	meta[cliproxyexecutor.ExcludedAuthIDsMetadataKey] = excluded
 	opts.Metadata = meta
 	return opts
 }

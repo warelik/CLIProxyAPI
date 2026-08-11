@@ -48,6 +48,10 @@ const (
 	DerivedSessionIDMetadataKey = "derived_session_id"
 	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
 	CallerScopeMetadataKey = "caller_scope"
+	// ExcludedAuthIDsMetadataKey carries the set of auth IDs that already failed
+	// (429/5xx/empty) within the current request and must never be re-selected
+	// for the remainder of that request. Value is map[string]struct{} or []string.
+	ExcludedAuthIDsMetadataKey = "request_excluded_auth_ids"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

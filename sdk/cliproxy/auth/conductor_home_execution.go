@@ -20,7 +20,7 @@ func (m *Manager) executeHome(ctx context.Context, providers []string, req clipr
 	tried := make(map[string]struct{})
 	var lastErr error
 	for homeAuthCount := 1; ; homeAuthCount++ {
-		selection, errSelection := m.pickHomeDispatchSelection(ctx, routeModel, withHomeAuthCount(opts, homeAuthCount))
+		selection, errSelection := m.pickHomeDispatchSelection(ctx, routeModel, withExcludedAuthIDs(withHomeAuthCount(opts, homeAuthCount), tried))
 		if errSelection != nil {
 			if shouldReturnLastErrorOnPickFailure(true, lastErr, errSelection) {
 				return cliproxyexecutor.Response{}, lastErr

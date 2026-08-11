@@ -2213,3 +2213,61 @@ func TestSessionAffinitySelector_FallbackReselectReceivesOnlyAvailable(t *testin
 		}
 	}
 }
+
+// TestSessionAffinitySelector_RequestScopedExclusionBreaksCarousel is a
+// regression test for the live bug where an auth that just failed (429/5xx/empty)
+// was re-picked for the SAME request repeatedly. In home/mixed mode per-attempt
+// failures never update local availability (reportHomeResult does not set a local
+// cooldown), so `getAvailableAuths` kept reporting the freshly-failed auth as
+// available and the session-affinity cache returned it on every retry. The fix
+// threads the request-scoped set of failed auth IDs through to the selector so a
+// failed auth is never re-picked for the remainder of that request, even though
+// it is still locally "available".
+func TestSessionAffinitySelector_RequestScopedExclusionBreaksCarousel(t *testing.T) {
+	t.Parallel()
+
+	rec := &recordingFallbackSelector{inner: &RoundRobinSelector{}}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: rec,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+		{ID: "auth-c"},
+	}
+
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_carousel-test"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	// First pick establishes the session-affinity binding to the first auth.
+	first, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+
+	// The first auth just failed (e.g. 429). Crucially we do NOT set any local
+	// cooldown/Unavailable flag: that mirrors the home/mixed-mode bug where
+	// reportHomeResult never updates local availability, so the auth stays
+	// locally available and would otherwise be re-picked by the cache hit.
+	failed := first.ID
+	opts.Metadata = map[string]any{
+		cliproxyexecutor.ExcludedAuthIDsMetadataKey: map[string]struct{}{failed: {}},
+	}
+
+	// Simulate the retry loop for the SAME request/session: pick again. The
+	// failed auth must never be returned, even though it is still locally
+	// available. Before the fix the cache hit returned `failed` on every retry,
+	// producing the 12x "cache hit but auth unavailable, reselected" carousel.
+	for attempt := 0; attempt < 20; attempt++ {
+		got, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+		if err != nil {
+			t.Fatalf("Pick() attempt %d error = %v", attempt, err)
+		}
+		if got.ID == failed {
+			t.Fatalf("attempt %d re-picked auth %q that already failed in this request; want a different auth", attempt, failed)
+		}
+	}
+}

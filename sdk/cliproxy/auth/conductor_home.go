@@ -711,7 +711,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	selection, errSelection := m.pickHomeDispatchSelection(ctx, model, opts)
+	selection, errSelection := m.pickHomeDispatchSelection(ctx, model, withExcludedAuthIDs(opts, tried))
 	if errSelection != nil {
 		return nil, nil, "", errSelection
 	}

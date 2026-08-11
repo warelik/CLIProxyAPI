@@ -248,10 +248,45 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+// excludedAuthIDsFromOptions extracts the request-scoped set of auth IDs that
+// already failed (429/5xx/empty) within the current request and must not be
+// re-selected. Supports map[string]struct{} or []string metadata values.
+func excludedAuthIDsFromOptions(opts cliproxyexecutor.Options) map[string]struct{} {
+	if opts.Metadata == nil {
+		return nil
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.ExcludedAuthIDsMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case map[string]struct{}:
+		return v
+	case map[string]bool:
+		set := make(map[string]struct{}, len(v))
+		for id, ex := range v {
+			if ex {
+				set[id] = struct{}{}
+			}
+		}
+		return set
+	case []string:
+		set := make(map[string]struct{}, len(v))
+		for _, id := range v {
+			set[id] = struct{}{}
+		}
+		return set
+	}
+	return nil
+}
+
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time, excluded map[string]struct{}) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
+		if _, skip := excluded[candidate.ID]; skip {
+			continue
+		}
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
 			priority := authPriority(candidate)
@@ -268,20 +303,24 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	return available, cooldownCount, earliest
 }
 
-func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
-	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false)
+func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, excluded ...map[string]struct{}) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false, excluded...)
 }
 
-func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
-	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true)
+func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time, excluded ...map[string]struct{}) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true, excluded...)
 }
 
-func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, allPriorities bool) ([]*Auth, error) {
+func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, allPriorities bool, excluded ...map[string]struct{}) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
+	var ex map[string]struct{}
+	if len(excluded) > 0 {
+		ex = excluded[0]
+	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now, ex)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -370,7 +409,7 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(auths, provider, model, now, excludedAuthIDsFromOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +455,7 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now())
+	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now(), excludedAuthIDsFromOptions(opts))
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
@@ -526,7 +565,7 @@ func saturatingAddInt64(value, delta int64) int64 {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(auths, provider, model, now, excludedAuthIDsFromOptions(opts))
 	if err != nil {
 		return nil, err
 	}
@@ -656,12 +695,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
+	excluded := excludedAuthIDsFromOptions(opts)
 	availabilityCandidates := auths
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getAvailableAuths(availabilityCandidates, provider, model, now)
+		fallbackAuths, errAvailable := getAvailableAuths(availabilityCandidates, provider, model, now, excluded)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
@@ -671,7 +711,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	// A single availability pass serves both lookups: the bound credential is validated against
 	// every priority tier, while the fallback selector keeps seeing only the highest tier.
-	available, err := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now)
+	available, err := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now, excluded)
 	if err != nil {
 		return nil, err
 	}

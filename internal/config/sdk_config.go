@@ -81,6 +81,6 @@ type StreamingConfig struct {
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
 
 	// StreamFirstChunkTimeoutSeconds controls the maximum time to wait for the first meaningful chunk from an upstream stream before timing out and failing over.
-	// A negative value disables the timeout. Zero uses the 20-second default.
+	// Zero or a negative value disables the timeout.
 	StreamFirstChunkTimeoutSeconds int `yaml:"stream-first-chunk-timeout-seconds,omitempty" json:"stream-first-chunk-timeout-seconds,omitempty"`
 }

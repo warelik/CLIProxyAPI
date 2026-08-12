@@ -91,6 +91,7 @@ func TestSessionAffinityQuarantineExpires(t *testing.T) {
 	if before.ID != authB.ID {
 		t.Fatalf("Pick before expiry = %q, want auth-b", before.ID)
 	}
+	selector.OnResult(Result{AuthID: authB.ID, Provider: "gemini", Model: ".gemini-flash", Success: false, Error: &Error{HTTPStatus: http.StatusBadGateway}, Options: opts})
 	time.Sleep(30 * time.Millisecond)
 	after, _ := selector.Pick(context.Background(), "mixed", ".gemini-flash", opts, []*Auth{authA, authB})
 	if after.ID != authA.ID {

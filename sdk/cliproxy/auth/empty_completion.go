@@ -482,7 +482,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		_ = json.Unmarshal(raw, &objName)
 	}
 
-	if objName != "response" && !openAIResponseEventTypes[evType] && probe["output"] == nil && probe["status"] == nil {
+	if objName != "response" && !openAIResponseEventTypes[evType] {
 		return false
 	}
 	a.recognized = true

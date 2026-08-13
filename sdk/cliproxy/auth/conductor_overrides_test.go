@@ -1127,7 +1127,13 @@ func TestManager_Execute_DisableCooling_DoesNotBlackoutAfter429RetryAfter(t *tes
 	}
 }
 
-func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) {
+// Retry config (3 attempts, 100ms cap) plus a 5ms Retry-After gives a genuine
+// nonzero retry opportunity here: shouldRetryAfterError returns (5ms, true) for
+// attempts 0-2. Pre-fix the same auth was re-picked on every outer retry
+// (4 executor calls); post-fix the request-scoped exclusion of failed auths
+// stops re-invocation, so a single auth with a retryable 429 is executed
+// exactly once per request.
+func TestManager_Execute_DisableCooling_NoReinvokeOnRetryable429(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
@@ -1173,8 +1179,8 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	}
 
 	calls := executor.ExecuteCalls()
-	if len(calls) != 4 {
-		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	if len(calls) != 1 {
+		t.Fatalf("execute calls = %d, want 1", len(calls))
 	}
 }
 

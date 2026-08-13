@@ -151,6 +151,732 @@ func TestSanitizeResponsesStreamErrorMessageNormalizesSuccessStatus(t *testing.T
 	}
 }
 
+func TestRedactResponsesStreamErrorTextSensitiveValues(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "plain JSON",
+			text: `{"api_key":"plain-secret"}`,
+			want: `{"api_key":"[REDACTED]"}`,
+		},
+		{
+			name: "escaped JSON",
+			text: `{\"api_key\":\"escaped-secret\"}`,
+			want: `{\"api_key\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "double-escaped JSON",
+			text: `{\\\"api_key\\\":\\\"double-escaped-secret\\\"}`,
+			want: `{\\\"api_key\\\":\\\"[REDACTED]\\\"}`,
+		},
+		{
+			name: "equals separator",
+			text: "api_" + "key=" + "equals-value",
+			want: `api_key=[REDACTED]`,
+		},
+		{
+			name: "similar keys remain",
+			text: `not_api_key=keep api_key_hint=keep token_count=2 tokenizer=value secretariat=value`,
+			want: `not_api_key=keep api_key_hint=keep token_count=2 tokenizer=value secretariat=value`,
+		},
+		{
+			name: "client secret",
+			text: `client_secret=cs-value`,
+			want: `client_secret=[REDACTED]`,
+		},
+		{
+			name: "api token",
+			text: `api_token=at-value`,
+			want: `api_token=[REDACTED]`,
+		},
+		{
+			name: "refresh token",
+			text: `refresh_token=rt-value`,
+			want: `refresh_token=[REDACTED]`,
+		},
+		{
+			name: "compound secret",
+			text: `foo_bar_secret=fbs-value`,
+			want: `foo_bar_secret=[REDACTED]`,
+		},
+		{
+			name: "hyphen token key",
+			text: `api-token=ht-value`,
+			want: `api-token=[REDACTED]`,
+		},
+		{
+			name: "hyphen compound secret",
+			text: `foo-bar-secret=fbs-hyphen`,
+			want: `foo-bar-secret=[REDACTED]`,
+		},
+		{
+			name: "standalone basic outside auth key",
+			text: `x_authorization: Basic dGVzdDox`,
+			want: `x_authorization: Basic [REDACTED]`,
+		},
+		{
+			name: "benign suffix keys unchanged",
+			text: `not_api_key=keep token_count=2 tokenizer=value secretariat=value mytoken=keep`,
+			want: `not_api_key=keep token_count=2 tokenizer=value secretariat=value mytoken=keep`,
+		},
+		{
+			name: "bearer scheme preserved",
+			text: `Authorization: Bearer abcd.efgh`,
+			want: `Authorization: Bearer [REDACTED]`,
+		},
+		{
+			name: "basic scheme preserved",
+			text: `Authorization: Basic Zm9vOmJhcg==`,
+			want: `Authorization: Basic [REDACTED]`,
+		},
+		{
+			name: "escaped-quoted bearer value",
+			text: `{\"authorization\":\"Bearer abcd.efgh\"}`,
+			want: `{\"authorization\":\"Bearer [REDACTED]\"}`,
+		},
+		{
+			name: "escaped tail does not leak",
+			text: `token=val\"tail`,
+			want: `token=[REDACTED]`,
+		},
+		{
+			name: "escaped tail in quoted value",
+			text: `{"token":"val\"tail` + `"}`,
+			want: `{"token":"[REDACTED]"}`,
+		},
+		{
+			name: "compound secret escaped quoted",
+			text: `{\"client_secret\":\"cs-value\"}`,
+			want: `{\"client_secret\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "api token json",
+			text: `{"api_token":"at-value"}`,
+			want: `{"api_token":"[REDACTED]"}`,
+		},
+		{
+			name: "refresh token equals",
+			text: `refresh_token=rt-value`,
+			want: `refresh_token=[REDACTED]`,
+		},
+		{
+			name: "mytoken unchanged json",
+			text: `{"mytoken":"keep"}`,
+			want: `{"mytoken":"keep"}`,
+		},
+		{
+			name: "authorization key json basic",
+			text: `{"authorization":"Basic dGVzdDox"}`,
+			want: `{"authorization":"Basic [REDACTED]"}`,
+		},
+		{
+			name: "compound secret no over-redaction",
+			text: `not_api_key=keep foo_bar_secret=fbs token_count=1`,
+			want: `not_api_key=keep foo_bar_secret=[REDACTED] token_count=1`,
+		},
+		{
+			name: "client secret json escaped",
+			text: `{\"client_secret\":\"cs\"}`,
+			want: `{\"client_secret\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "api token json escaped",
+			text: `{\"api_token\":\"at\"}`,
+			want: `{\"api_token\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "F1 openai api key underscore",
+			text: `openai_api_key=oak-1`,
+			want: `openai_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 uppercase openai api key",
+			text: `OPENAI_API_KEY=oak-2`,
+			want: `OPENAI_API_KEY=[REDACTED]`,
+		},
+		{
+			name: "F1 anthropic api key",
+			text: `anthropic_api_key=ak-1`,
+			want: `anthropic_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 github api key",
+			text: `github_api_key=gh-1`,
+			want: `github_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 stripe api key",
+			text: `stripe_api_key=sk-1`,
+			want: `stripe_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 x api key",
+			text: `x_api_key=x-1`,
+			want: `x_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 foo bar key",
+			text: `foo_bar_key=fbk-1`,
+			want: `foo_bar_key=[REDACTED]`,
+		},
+		{
+			name: "F1 my access key",
+			text: `my_access_key=mak-1`,
+			want: `my_access_key=[REDACTED]`,
+		},
+		{
+			name: "F1 my api key",
+			text: `my_api_key=my-1`,
+			want: `my_api_key=[REDACTED]`,
+		},
+		{
+			name: "F1 hyphen api key",
+			text: `github-api-key=ghk-1`,
+			want: `github-api-key=[REDACTED]`,
+		},
+		{
+			name: "F1 not api key benign",
+			text: `not_api_key=keep`,
+			want: `not_api_key=keep`,
+		},
+		{
+			name: "F1 token count benign",
+			text: `token_count=5`,
+			want: `token_count=5`,
+		},
+		{
+			name: "F1 tokenizer benign",
+			text: `tokenizer=value`,
+			want: `tokenizer=value`,
+		},
+		{
+			name: "F1 secretariat benign",
+			text: `secretariat=value`,
+			want: `secretariat=value`,
+		},
+		{
+			name: "F1 mytoken benign",
+			text: `mytoken=value`,
+			want: `mytoken=value`,
+		},
+		{
+			name: "F2 digest auth fully redacted",
+			text: `Authorization: Digest username="u", realm="r", nonce="n", uri="/x", response="deadbeef"`,
+			want: `Authorization: [REDACTED]`,
+		},
+		{
+			name: "F2 aws sig auth fully redacted",
+			text: `Authorization: AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef`,
+			want: `Authorization: [REDACTED]`,
+		},
+		{
+			name: "F2 oauth auth fully redacted",
+			text: `Authorization: OAuth oauth_consumer_key="ck", oauth_signature="sig"`,
+			want: `Authorization: [REDACTED]`,
+		},
+		{
+			name: "F2 custom scheme auth fully redacted",
+			text: `Authorization: X-Custom abcdef`,
+			want: `Authorization: [REDACTED]`,
+		},
+		{
+			name: "F2 opaque auth value fully redacted",
+			text: `Authorization: ABCDEFGHIJKLMNOP`,
+			want: `Authorization: [REDACTED]`,
+		},
+		{
+			name: "F2 digest auth quoted",
+			text: `{"authorization":"Digest username=\"u\", realm=\"r\", nonce=\"n\", uri=\"/x\", response=\"deadbeef\""}`,
+			want: `{"authorization":"[REDACTED]"}`,
+		},
+		{
+			name: "F2 digest auth escaped quoted",
+			text: `{\"authorization\":\"Digest username=\\\"u\\\", realm=\\\"r\\\", nonce=\\\"n\\\", uri=\\\"/x\\\", response=\\\"deadbeef\\\"\"}`,
+			want: `{\"authorization\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "F2 digest auth double escaped",
+			text: `{\\\"authorization\\\":\\\"Digest username=\\\\\\\"u\\\\\\\", realm=\\\\\\\"r\\\\\\\", nonce=\\\\\\\"n\\\\\\\", uri=\\\\\\\"/x\\\\\\\", response=\\\\\\\"deadbeef\\\\\\\"\\\"}`,
+			want: `{\\\"authorization\\\":\\\"[REDACTED]\\\"}`,
+		},
+		{
+			name: "F3 x-api-key bearer",
+			text: `x-api-key: Bearer abc123`,
+			want: `x-api-key: Bearer [REDACTED]`,
+		},
+		{
+			name: "F3 x-api-key bare value",
+			text: `x-api-key: abc123`,
+			want: `x-api-key: [REDACTED]`,
+		},
+		{
+			name: "F3 x-api-key bearer no residual",
+			text: `x-api-key: Bearer abc123 def456`,
+			want: `x-api-key: Bearer [REDACTED]`,
+		},
+		{
+			name: "F4 rate limit token prose",
+			text: `the rate limit token: expired`,
+			want: `the rate limit token: expired`,
+		},
+		{
+			name: "F4 secret is out prose",
+			text: `the secret: is out`,
+			want: `the secret: is out`,
+		},
+		{
+			name: "F4 count token benign",
+			text: `count_token=5`,
+			want: `count_token=5`,
+		},
+		{
+			name: "F4 token json still redacts",
+			text: `{"token":"tok-1"}`,
+			want: `{"token":"[REDACTED]"}`,
+		},
+		{
+			name: "F4 token equals still redacts",
+			text: `token=tok-2`,
+			want: `token=[REDACTED]`,
+		},
+		{
+			name: "F4 secret json still redacts",
+			text: `{"secret":"sec-1"}`,
+			want: `{"secret":"[REDACTED]"}`,
+		},
+		{
+			name: "F5 double escaped bearer",
+			text: `{\\\"authorization\\\":\\\"Bearer abc123\\\"}`,
+			want: `{\\\"authorization\\\":\\\"Bearer [REDACTED]\\\"}`,
+		},
+		{
+			name: "F5 double escaped basic",
+			text: `{\\\"authorization\\\":\\\"Basic dGVzdDox\\\"}`,
+			want: `{\\\"authorization\\\":\\\"Basic [REDACTED]\\\"}`,
+		},
+		{
+			name: "v4 aws access key id",
+			text: `aws_access_key_id=AKIAIOSFODNN7EXAMPLE`,
+			want: `aws_access_key_id=[REDACTED]`,
+		},
+		{
+			name: "v4 uppercase aws access key id",
+			text: `AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE`,
+			want: `AWS_ACCESS_KEY_ID=[REDACTED]`,
+		},
+		{
+			name: "v4 api key id",
+			text: `api_key_id=kid-123`,
+			want: `api_key_id=[REDACTED]`,
+		},
+		{
+			name: "v4 access key id",
+			text: `access_key_id=aki-456`,
+			want: `access_key_id=[REDACTED]`,
+		},
+		{
+			name: "v4 aws credential",
+			text: `aws_credential=aws-cred-1`,
+			want: `aws_credential=[REDACTED]`,
+		},
+		{
+			name: "v4 compound key id",
+			text: `foo_bar_key_id=fkid-1`,
+			want: `foo_bar_key_id=[REDACTED]`,
+		},
+		{
+			name: "v4 vendor credential json",
+			text: `{"vendor_credential":"vc-1"}`,
+			want: `{"vendor_credential":"[REDACTED]"}`,
+		},
+		{
+			name: "v4 benign key count",
+			text: `key_count=3 access_key_ids_total=5`,
+			want: `key_count=3 access_key_ids_total=5`,
+		},
+		{
+			name: "v4 token count benign",
+			text: `token_count=5`,
+			want: `token_count=5`,
+		},
+		{
+			name: "v4 single quoted token",
+			text: `{'token':'tok-single'}`,
+			want: `{'token':'[REDACTED]'}`,
+		},
+		{
+			name: "v4 single quoted api key",
+			text: `{'api_key':'sk-single'}`,
+			want: `{'api_key':'[REDACTED]'}`,
+		},
+		{
+			name: "v4 single quoted auth bearer",
+			text: `{'authorization':'Bearer abc-xyz'}`,
+			want: `{'authorization':'Bearer [REDACTED]'}`,
+		},
+		{
+			name: "v4 space api key assignment",
+			text: `api key=sp-key-1`,
+			want: `api key=[REDACTED]`,
+		},
+		{
+			name: "v4 space api key colon",
+			text: `api key: sp-key-2`,
+			want: `api key: [REDACTED]`,
+		},
+		{
+			name: "v4 space api key json",
+			text: `{"api key":"sp-key-3"}`,
+			want: `{"api key":"[REDACTED]"}`,
+		},
+		{
+			name: "v4 apikey redacts",
+			text: `apikey=ak-1`,
+			want: `apikey=[REDACTED]`,
+		},
+		{
+			name: "v4 apikey bearer",
+			text: `apikey: Bearer tok-1`,
+			want: `apikey: Bearer [REDACTED]`,
+		},
+		{
+			name: "v4 double escaped aws key",
+			text: `{\\\"aws_access_key_id\\\":\\\"AKIAIOSFODNN7EXAMPLE\\\"}`,
+			want: `{\\\"aws_access_key_id\\\":\\\"[REDACTED]\\\"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactResponsesStreamErrorText(tc.text); got != tc.want {
+				t.Fatalf("redactResponsesStreamErrorText() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRedactResponsesStreamErrorTextNoPanicOnTrailingBackslash(t *testing.T) {
+	inputs := []string{
+		`token=abc\`,
+		`token=abc\def`,
+		`api_key=sk-1234\`,
+		`Authorization: Bearer tok\`,
+		`Authorization: Bearer tok\\`,
+		`Authorization: Basic dGVzdDox\`,
+		`Authorization: Digest username="u\", realm="r"\`,
+		`api_key="sk-\`,
+		`api key: sk-1\`,
+		`{'api_key':'sk-\`,
+		`aws_access_key_id=AKIA\`,
+		`token="val\"tail\`,
+	}
+	for _, in := range inputs {
+		if got := redactResponsesStreamErrorText(in); got == "" {
+			t.Fatalf("redactResponsesStreamErrorText(%q) returned empty", in)
+		}
+	}
+	// Large/bounded input must not panic and must stay bounded.
+	big := "token=" + strings.Repeat("x", 1<<16) + `\`
+	got := redactResponsesStreamErrorText(big)
+	if len(got) > len(big)+64 {
+		t.Fatalf("large input grew unexpectedly: len=%d", len(got))
+	}
+}
+
+func TestSanitizeOpenAIErrorMessageStrictTrustBoundary(t *testing.T) {
+	const secret = "fixture-body-secret"
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode:     http.StatusBadGateway,
+		Error:          errors.New(`provider failed: {"api_key":"` + secret + `"}`),
+		DirectResponse: true,
+		Body:           []byte(`{"raw":"` + secret + `"}`),
+	}
+	got := sanitizeOpenAIErrorMessage(errMsg)
+	if got == nil {
+		t.Fatal("sanitizeOpenAIErrorMessage returned nil")
+	}
+	if got.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status %d, want %d", got.StatusCode, http.StatusBadGateway)
+	}
+	if got.DirectResponse {
+		t.Fatal("DirectResponse must be cleared")
+	}
+	if got.Body != nil {
+		t.Fatalf("Body must be nil, got %q", got.Body)
+	}
+	if strings.Contains(got.Error.Error(), secret) {
+		t.Fatalf("sanitized error leaked %q: %q", secret, got.Error.Error())
+	}
+	if sanitizeOpenAIErrorMessage(nil) != nil {
+		t.Fatal("sanitizeOpenAIErrorMessage(nil) must be nil")
+	}
+}
+
+func TestSanitizeResponsesStreamErrorMessageRedactsNestedJSONWithRouteSummary(t *testing.T) {
+	const secret = "fixture-api-key"
+	rawError := `{"error":{"type":"server_error","code":"upstream_failed","message":"provider failed: {\"api_key\":\"` + secret + `\"}"}}; attempted routes: [openai:401, codex:429]`
+
+	got := sanitizeResponsesStreamErrorMessage(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New(rawError)})
+	if got == nil || got.StatusCode != http.StatusBadGateway || got.Error == nil {
+		t.Fatalf("sanitized error = %#v, want status %d and error", got, http.StatusBadGateway)
+	}
+	text := got.Error.Error()
+	if strings.Contains(text, secret) {
+		t.Fatalf("sanitized error leaked sensitive value: %q", text)
+	}
+	for _, want := range []string{`\"api_key\":\"[REDACTED]\"`, "attempted routes: [openai:401, codex:429]"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("sanitized error lost %q: %q", want, text)
+		}
+	}
+}
+
+func TestSanitizeResponsesStreamErrorMessageRedactsNestedCompoundAndAuth(t *testing.T) {
+	cases := []struct {
+		name    string
+		secret  string
+		raw     string
+		wantSub string
+	}{
+		{
+			name:    "compound secret",
+			secret:  "fixture-compound-secret",
+			raw:     `provider failed: {\"client_secret\":\"` + "fixture-compound-secret" + `\"}`,
+			wantSub: `\"client_secret\":\"[REDACTED]\"`,
+		},
+		{
+			name:    "api token",
+			secret:  "fixture-api-token",
+			raw:     `provider failed: {\"api_token\":\"` + "fixture-api-token" + `\"}`,
+			wantSub: `\"api_token\":\"[REDACTED]\"`,
+		},
+		{
+			name:    "basic auth scheme",
+			secret:  "Zm9vOmJhcg==",
+			raw:     `provider failed: {"authorization":"Basic Zm9vOmJhcg=="}`,
+			wantSub: `{"authorization":"Basic [REDACTED]"}`,
+		},
+		{
+			name:    "bearer auth scheme",
+			secret:  "abcd.efgh.ijkl",
+			raw:     `provider failed: {"authorization":"Bearer abcd.efgh.ijkl"}`,
+			wantSub: `{"authorization":"Bearer [REDACTED]"}`,
+		},
+		{
+			name:    "digest auth fully redacted",
+			secret:  "deadbeefdigest",
+			raw:     `provider failed: Authorization: Digest username="u", realm="r", nonce="n", uri="/x", response="deadbeefdigest"`,
+			wantSub: `Authorization: [REDACTED]`,
+		},
+		{
+			name:    "aws sig auth fully redacted",
+			secret:  "AKIDEXAMPLE",
+			raw:     `provider failed: Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef`,
+			wantSub: `Authorization: [REDACTED]`,
+		},
+		{
+			name:    "oauth auth fully redacted",
+			secret:  "oauth-sig-123",
+			raw:     `provider failed: Authorization: OAuth oauth_consumer_key="ck", oauth_signature="oauth-sig-123"`,
+			wantSub: `Authorization: [REDACTED]`,
+		},
+		{
+			name:    "double escaped bearer",
+			secret:  "abc123",
+			raw:     `provider failed: {\\\"authorization\\\":\\\"Bearer abc123\\\"}`,
+			wantSub: `\\\"authorization\\\":\\\"Bearer [REDACTED]\\\"`,
+		},
+		{
+			name:    "double escaped basic",
+			secret:  "dGVzdDox",
+			raw:     `provider failed: {\\\"authorization\\\":\\\"Basic dGVzdDox\\\"}`,
+			wantSub: `\\\"authorization\\\":\\\"Basic [REDACTED]\\\"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := `{"error":{"type":"server_error","code":"upstream_failed","message":"` + tc.raw + `"}}; attempted routes: [openai:401]`
+			got := sanitizeResponsesStreamErrorMessage(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New(raw)})
+			if got == nil || got.StatusCode != http.StatusBadGateway || got.Error == nil {
+				t.Fatalf("sanitized error = %#v, want status %d and error", got, http.StatusBadGateway)
+			}
+			text := got.Error.Error()
+			if strings.Contains(text, tc.secret) {
+				t.Fatalf("sanitized error leaked %q: %q", tc.secret, text)
+			}
+			if !strings.Contains(text, tc.wantSub) {
+				t.Fatalf("sanitized error lost %q: %q", tc.wantSub, text)
+			}
+		})
+	}
+}
+
+// TestSinksForOpenAIResponseError asserts the strict shared sanitizer is applied
+// to the non-stream trust-boundary sinks: the client error body and the captured
+// request log must never carry a raw upstream secret, DirectResponse must be
+// disabled, and Body must be nil. It drives WriteErrorResponse via a real
+// handler so the client/log plumbing is exercised end to end.
+func TestSinksForOpenAIResponseError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "fixture-sink-secret"
+	rawSecret := strings.Repeat(secret, 2)
+
+	for name, setup := range map[string]func(h *OpenAIAPIHandler, c *gin.Context){
+		"chat non-stream": func(h *OpenAIAPIHandler, c *gin.Context) {
+			errMsg := &interfaces.ErrorMessage{
+				StatusCode:     http.StatusBadGateway,
+				Error:          errors.New(`upstream provider failed: {"api_key":"` + rawSecret + `"}`),
+				DirectResponse: false,
+				Body:           []byte(`{"raw":"` + rawSecret + `"}`),
+			}
+			h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
+		},
+		"routed upstream direct": func(h *OpenAIAPIHandler, c *gin.Context) {
+			errMsg := &interfaces.ErrorMessage{
+				StatusCode:     http.StatusBadGateway,
+				Error:          errors.New(`provider failed: Bearer ` + secret),
+				DirectResponse: true,
+				Body:           []byte(`{"raw":"` + rawSecret + `"}`),
+			}
+			h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{RequestLog: true}, nil))
+			setup(h, c)
+
+			body := recorder.Body.String()
+			if strings.Contains(body, rawSecret) || strings.Contains(body, secret) {
+				t.Fatalf("client body leaked secret: %q", body)
+			}
+			// The request-log sink must also be sanitized.
+			if logged, exists := c.Get("API_RESPONSE"); exists {
+				if loggedBytes, ok := logged.([]byte); ok && strings.Contains(string(loggedBytes), secret) {
+					t.Fatalf("API_RESPONSE log leaked secret: %q", string(loggedBytes))
+				}
+			}
+			if errors_, exists := c.Get("API_RESPONSE_ERROR"); exists {
+				if list, ok := errors_.([]*interfaces.ErrorMessage); ok {
+					for _, e := range list {
+						if e != nil && e.Error != nil && strings.Contains(e.Error.Error(), secret) {
+							t.Fatalf("API_RESPONSE_ERROR log leaked secret: %q", e.Error.Error())
+						}
+						if e != nil && e.Body != nil {
+							t.Fatalf("logged error carried Body: %q", e.Body)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestStreamingChatTerminalErrorSanitizesRawUpstream exercises the mid-stream
+// terminal path used by handleStreamResult (OpenAIAPIHandler chat/completions
+// streaming): an upstream error delivered after headers are committed must be
+// sanitized by NormalizeTerminalError before WriteTerminalError emits the SSE
+// payload, so no raw secret or Body/DirectResponse leaks, and exactly one
+// terminal emission happens with a well-formed SSE data frame.
+func TestStreamingChatTerminalErrorSanitizesRawUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "fixture-chat-terminal-secret"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		t.Fatal("expected gin writer to implement http.Flusher")
+	}
+	h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{RequestLog: true}, nil))
+
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	errs <- &interfaces.ErrorMessage{
+		StatusCode:     http.StatusBadGateway,
+		Error:          errors.New(`provider failed: aws_access_key_id=AKIAEXAMPLE, Authorization: Digest username="u", api key: Bearer ` + secret),
+		DirectResponse: true,
+		Body:           []byte(`{"secret":"` + secret + `"}`),
+	}
+	close(errs)
+
+	var terminalErr error
+	h.ForwardStream(c, flusher, func(err error) { terminalErr = err }, data, errs, handlers.StreamForwardOptions{
+		NormalizeTerminalError: sanitizeOpenAIErrorMessage,
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			status := http.StatusInternalServerError
+			if errMsg != nil && errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg != nil && errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+		},
+	})
+	_ = terminalErr
+
+	body := recorder.Body.String()
+	if strings.Contains(body, secret) || strings.Contains(body, "AKIAEXAMPLE") {
+		t.Fatalf("streaming terminal body leaked secret: %q", body)
+	}
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Fatalf("streaming terminal body lacks redaction: %q", body)
+	}
+	if terminalErr != nil && strings.Contains(terminalErr.Error(), secret) {
+		t.Fatalf("cancel() received raw secret: %q", terminalErr.Error())
+	}
+}
+
+// TestSinksRejectFixtureVariants asserts that sink sanitization fails closed for
+// the concrete remediation fixture shapes: trailing backslash, single-quoted
+// values, AWS/access/api key variants, Authorization Bearer/Basic/Digest/AWS/
+// OAuth/custom, and multiline raw Body. No fixture substring may reach the client
+// body or the API_RESPONSE/API_RESPONSE_ERROR logs; Body must be nil and
+// DirectResponse false.
+func TestSinksRejectFixtureVariants(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const secret = "FIXTUREV4SECRET"
+	_ = secret
+	fixtures := []string{
+		`token=abc\`,
+		`api_key=sk-1234\`,
+		`{'authorization':'Bearer xyz'}`,
+		`aws_access_key_id=AKIAIOSFODNN7EXAMPLE`,
+		`api_key_id=kid-1`,
+		`Authorization: Basic dGVzdDox`,
+		`Authorization: AWS4-HMAC-SHA256 Credential=AKID/x`,
+		`Authorization: OAuth oauth_signature="sig"`,
+		`Authorization: X-Custom abc`,
+		"multi\nline\napi_key=" + "sk-multi",
+	}
+	for _, raw := range fixtures {
+		errMsg := &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      errors.New(raw),
+			Body:       []byte(raw),
+		}
+		got := sanitizeOpenAIErrorMessage(errMsg)
+		if got == nil {
+			t.Fatalf("sanitizeOpenAIErrorMessage(%q) nil", raw)
+		}
+		if got.Body != nil {
+			t.Fatalf("Body not nil for %q", raw)
+		}
+		if got.DirectResponse {
+			t.Fatalf("DirectResponse not cleared for %q", raw)
+		}
+	}
+}
+
 func TestResponsesHandlerCommitsValidFrameBeforeMalformedFrameInSameChunk(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

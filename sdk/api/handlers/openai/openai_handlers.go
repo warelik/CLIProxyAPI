@@ -440,7 +440,7 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -493,7 +493,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -544,7 +544,7 @@ func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context,
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -600,7 +600,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 				errChan = nil
 				continue
 			}
-			h.WriteErrorResponse(c, errMsg)
+			h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -666,6 +666,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 }
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		NormalizeTerminalError: sanitizeOpenAIErrorMessage,
 		WriteChunk: func(chunk []byte) {
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 		},

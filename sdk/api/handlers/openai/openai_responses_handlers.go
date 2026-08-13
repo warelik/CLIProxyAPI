@@ -577,7 +577,7 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -603,7 +603,7 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
+		h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 		cliCancel(errMsg.Error)
 		return
 	}
@@ -725,8 +725,8 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 					return
 				}
 
-				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-				h.WriteErrorResponse(c, errMsg)
+				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), sanitizeOpenAIErrorMessage(errMsg))
+				h.WriteErrorResponse(c, sanitizeOpenAIErrorMessage(errMsg))
 				if errMsg != nil {
 					cliCancel(errMsg.Error)
 				} else {
@@ -779,8 +779,28 @@ const (
 )
 
 var (
-	responsesStreamSensitiveValuePattern = regexp.MustCompile(`(?i)((?:"?(?:api[_-]?key|access[_-]?token|token|authorization|secret)"?)\s*[=:]\s*"?)([^\s"&,;}]+)`)
-	responsesStreamBearerPattern         = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+`)
+	// responsesStreamKeyPattern matches a sensitive key name and its separator
+	// (= or :), preceded by a boundary and optional quote/escape syntax.
+	// Group 1 is the leading boundary/quote syntax, group 2 the key, group 3
+	// the trailing quote/space syntax plus separator.
+	responsesStreamKeyPattern = regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9_])(?:\\*["']?)?)(api[_-]?key|apikey|access[_-]?key[_-]?id|aws[_-]?access[_-]?key[_-]?id|api[_-]?key[_-]?id|access[_-]?token|authorization|token|secret|credential|aws[_-]?credential|(?:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*)[_-](?:key|token|secret|credential|key[_-]?id))((?:\\*["']?)?\s*[=:])`)
+	// responsesStreamSpaceAPIKeyPattern matches the "api key:" spelling with a
+	// space between api and key, in header/assignment contexts. Group 1 is the
+	// boundary, group 2 the key, group 3 the separator — mirroring
+	// responsesStreamKeyPattern so the shared redaction loop applies uniformly.
+	responsesStreamSpaceAPIKeyPattern = regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9_]))(api[ _]key)(["']?\s*[=:])`)
+	// responsesStreamBareKeyDenyPattern marks key names that merely mention a
+	// credential kind without being a credential themselves (not_api_key,
+	// count_token, tokenizer, secretariat, mytoken, key_count, token_count).
+	responsesStreamBareKeyDenyPattern = regexp.MustCompile(`(?i)^(?:not|non|no|count|counter|key[_-]?count|token[_-]?count)(?:[_-]|$)`)
+	// responsesStreamAuthSchemePattern detects a Bearer/Basic scheme at the
+	// start of a credential value so the scheme can be preserved. Other schemes
+	// (Digest, AWS4-HMAC-SHA256, OAuth, custom) are not recognized and their
+	// entire value is redacted.
+	responsesStreamAuthSchemePattern = regexp.MustCompile(`(?i)^(Bearer|Basic)\s+`)
+	// responsesStreamAuthPattern redacts standalone Bearer/Basic credentials
+	// that appear outside key/value contexts (e.g. embedded in event names).
+	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([^\s,;"'\\]*[0-9A-Z._~+/=-][^\s,;"'\\]*)`)
 )
 
 func truncateResponsesStreamErrorText(text string, limit int) string {
@@ -792,8 +812,256 @@ func truncateResponsesStreamErrorText(text string, limit int) string {
 }
 
 func redactResponsesStreamErrorText(text string) string {
-	text = responsesStreamSensitiveValuePattern.ReplaceAllString(text, `${1}[REDACTED]`)
-	return responsesStreamBearerPattern.ReplaceAllString(text, "Bearer [REDACTED]")
+	text = redactResponsesStreamKeyValues(text)
+	return responsesStreamAuthPattern.ReplaceAllString(text, `${1}[REDACTED]`)
+}
+
+// redactResponsesStreamKeyValues locates sensitive key/value pairs and replaces
+// their credential with [REDACTED], preserving any surrounding quote/escape
+// syntax and, for Bearer/Basic values, the scheme. Compound keys (any name
+// ending in _key/-key/_token/-token/_secret/-secret/_credential or key-id
+// variants) always redact; bare token/secret/credential keys redact only in
+// explicit JSON, assignment, or line-start header contexts.
+func redactResponsesStreamKeyValues(text string) string {
+	type keyMatch struct {
+		loc []int
+		key string
+	}
+	var matches []keyMatch
+	for _, loc := range responsesStreamKeyPattern.FindAllStringSubmatchIndex(text, -1) {
+		matches = append(matches, keyMatch{loc: loc, key: text[loc[4]:loc[5]]})
+	}
+	for _, loc := range responsesStreamSpaceAPIKeyPattern.FindAllStringSubmatchIndex(text, -1) {
+		matches = append(matches, keyMatch{loc: loc, key: "api key"})
+	}
+	if len(matches) == 0 {
+		return text
+	}
+	sort.Slice(matches, func(a, b int) bool { return matches[a].loc[0] < matches[b].loc[0] })
+	var b strings.Builder
+	b.Grow(len(text) + 16*len(matches))
+	last := 0
+	for _, m := range matches {
+		loc := m.loc
+		if loc[0] < last {
+			continue
+		}
+		key := strings.ToLower(m.key)
+		if responsesStreamBareKeyDenyPattern.MatchString(key) {
+			continue
+		}
+		if key == "token" || key == "secret" || key == "credential" {
+			if !responsesStreamBareKeyContextOK(text, loc) {
+				continue
+			}
+		}
+		sepEnd := loc[1]
+		valueEnd, redactStart, redactEnd := responsesStreamValueBounds(text, sepEnd, key == "authorization" || key == "api key")
+		b.WriteString(text[last:sepEnd])
+		b.WriteString(text[sepEnd:redactStart])
+		if redactEnd > redactStart {
+			b.WriteString("[REDACTED]")
+		}
+		b.WriteString(text[redactEnd:valueEnd])
+		last = valueEnd
+	}
+	b.WriteString(text[last:])
+	return b.String()
+}
+
+// responsesStreamBareKeyContextOK applies the deterministic context rule for
+// bare token/secret/credential keys: they redact only as explicit JSON fields,
+// '=' assignments, or line-start headers, never in prose like "the secret: is
+// out".
+func responsesStreamBareKeyContextOK(text string, loc []int) bool {
+	if loc[4] == 0 || text[loc[4]-1] == '\n' {
+		return true // line-start header
+	}
+	if b := text[loc[4]-1]; b == '"' || b == '\\' || b == '\'' {
+		return true // JSON or escaped-JSON field (single or double quoted)
+	}
+	for i := loc[6]; i < loc[7]; i++ {
+		if text[i] == '=' {
+			return true // assignment
+		}
+	}
+	return false
+}
+
+// responsesStreamValueBounds returns the region [redactStart, redactEnd) to
+// replace with [REDACTED] for the value starting at start, and the full value
+// span [start, valueEnd) that the redaction consumes. Quoted values (single or
+// double) keep their opening/closing quote syntax. Unquoted generic values stop
+// at whitespace so prose after a credential is untouched; Bearer/Basic
+// credentials span the space between scheme and token; authorization/api key
+// values consume the whole multi-part value so no parameter or credential tail
+// leaks. All scans clamp to the input length (no panic on a trailing lone
+// backslash).
+func responsesStreamValueBounds(text string, start int, isAuth bool) (valueEnd, redactStart, redactEnd int) {
+	n := len(text)
+	i := start
+	for i < n && (text[i] == ' ' || text[i] == '\t') {
+		i++
+	}
+	if i >= n {
+		return start, start, start
+	}
+	backslashes := 0
+	j := i
+	for j < n && text[j] == '\\' {
+		backslashes++
+		j++
+	}
+	if j < n && (text[j] == '"' || text[j] == '\'') {
+		quote := text[j]
+		openEnd := j + 1 // after the opening quote
+		closeStart, closeEnd := responsesStreamQuoteClose(text, openEnd, quote, backslashes)
+		if schemeEnd := responsesStreamAuthSchemeEnd(text, openEnd); schemeEnd >= 0 && schemeEnd <= closeStart {
+			return closeEnd, schemeEnd, closeStart
+		}
+		return closeEnd, openEnd, closeStart
+	}
+	// Unquoted value: first scan to the nearest delimiter (clamped).
+	end := i
+	for end < n {
+		c := text[end]
+		if c == '\\' {
+			if end+1 >= n {
+				end = n
+				break
+			}
+			end += 2
+			continue
+		}
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '}' || c == ')' || c == ']' || c == ',' || c == ';' || c == '\'' || c == '"' {
+			break
+		}
+		end++
+	}
+	if schemeEnd := responsesStreamAuthSchemeEnd(text, i); schemeEnd >= 0 {
+		// Bearer/Basic: the credential spans whitespace (e.g. "Bearer abc").
+		credEnd := schemeEnd
+		for credEnd < n {
+			c := text[credEnd]
+			if c == '\\' {
+				if credEnd+1 >= n {
+					credEnd = n
+					break
+				}
+				credEnd += 2
+				continue
+			}
+			if c == '\n' || c == '\r' || c == '}' || c == ')' || c == ']' || c == ',' || c == ';' || c == '"' {
+				break
+			}
+			credEnd++
+		}
+		return credEnd, schemeEnd, credEnd
+	}
+	if isAuth {
+		// Authorization/api key with a non-Bearer/Basic scheme or opaque value:
+		// consume the entire multi-part value (Digest params, AWS Signature,
+		// OAuth) so no parameter or credential tail leaks.
+		authEnd := i
+		for authEnd < n {
+			c := text[authEnd]
+			if c == '\\' {
+				if authEnd+1 >= n {
+					authEnd = n
+					break
+				}
+				authEnd += 2
+				continue
+			}
+			if c == '\n' || c == '\r' || c == '}' || c == ')' || c == ']' {
+				break
+			}
+			authEnd++
+		}
+		return authEnd, i, authEnd
+	}
+	return end, i, end
+}
+
+// responsesStreamQuoteClose finds the closing quote syntax of a quoted value
+// starting after the opening quote at openEnd. quote is the quote byte ('"' or
+// '\”); openRun is the number of consecutive backslashes immediately before
+// the opening quote (0 for plain JSON). It returns closeSyntaxStart (where the
+// closing quote syntax begins, including any backslash run) and closeEnd (just
+// after the closing quote) so the redaction region [redactStart, redactEnd) can
+// be [openEnd, closeSyntaxStart) and preserve the surrounding quote/escape
+// syntax. For escaped-quoted values ("\"" or "\\\""), the closing quote carries
+// the same backslash-run length as the opening quote; interior content quotes
+// from deeper escape levels carry longer backslash runs and are treated as
+// content, so multi-parameter auth values (Digest/AWS/OAuth) redact cleanly.
+// All scans clamp to the input length (no panic on a trailing lone backslash).
+func responsesStreamQuoteClose(text string, openEnd int, quote byte, openRun int) (closeSyntaxStart, closeEnd int) {
+	n := len(text)
+	if openRun == 0 {
+		// Plain string: `\x` is an escape unit; the quote byte terminates.
+		k := openEnd
+		for k < n {
+			if text[k] == '\\' {
+				if k+1 >= n {
+					return n, n
+				}
+				k += 2
+				continue
+			}
+			if text[k] == quote {
+				return k, k + 1
+			}
+			k++
+		}
+		return n, n
+	}
+	// Escaped-quoted value: match the opening backslash-run length.
+	k := openEnd
+	for k < n {
+		if text[k] == '\\' {
+			r := 0
+			j := k
+			for j < n && text[j] == '\\' {
+				r++
+				j++
+			}
+			if j < n && text[j] == quote {
+				if r == openRun {
+					return j - openRun, j + 1 // structural closing quote
+				}
+				if r > openRun {
+					// Deeper-escaped content quote (Digest/AWS params).
+					k = j + 1
+					continue
+				}
+				return j - r, j + 1 // shorter run: malformed, fail-safe closing
+			}
+			k = j
+			continue
+		}
+		if text[k] == quote {
+			return k, k + 1
+		}
+		k++
+	}
+	return n, n
+}
+
+// responsesStreamAuthSchemeEnd reports the position just after a Bearer/Basic
+// scheme word plus following whitespace at start, or -1 when no such scheme is
+// present. Non-Bearer/Basic schemes are intentionally not recognized so their
+// entire value (including parameters) is redacted.
+func responsesStreamAuthSchemeEnd(text string, start int) int {
+	i := start
+	n := len(text)
+	for i < n && (text[i] == ' ' || text[i] == '\t') {
+		i++
+	}
+	m := responsesStreamAuthSchemePattern.FindStringSubmatchIndex(text[i:])
+	if m == nil {
+		return -1
+	}
+	return i + m[1]
 }
 
 func sanitizeResponsesStreamEventName(eventName string) string {
@@ -883,6 +1151,20 @@ func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *inter
 	safe.DirectResponse = false
 	safe.Body = nil
 	return &safe
+}
+
+// sanitizeOpenAIErrorMessage is the strict trust-boundary sanitizer shared by
+// the OpenAI Responses/Images/Videos handlers. It always sanitizes, unlike
+// sanitizeResponsesInitialErrorMessage which preserves DirectResponse: the
+// non-stream upstream error paths (client body + request/error logging) must
+// never emit a raw upstream ErrorMessage, Body, or unsafe DirectResponse flag.
+// It clears Body and forces DirectResponse=false exactly as the streaming
+// helper does, and returns nil for a nil input.
+func sanitizeOpenAIErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
+	if errMsg == nil {
+		return nil
+	}
+	return sanitizeResponsesStreamErrorMessage(errMsg)
 }
 
 func (h *OpenAIResponsesAPIHandler) logResponsesStreamError(c *gin.Context, framer *responsesSSEFramer, errMsg *interfaces.ErrorMessage) {

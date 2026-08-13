@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -113,7 +114,12 @@ func sanitizeStatus(err error) string {
 	return "error"
 }
 
-type routeExhaustionError struct {
+// routeExhaustionClonedError wraps the original route-exhaustion cause without
+// cloning or mutating it, so typed access (errors.As(*Error), status, retry,
+// HomeConcurrencyBusyError) and the sanitized route summary both survive the
+// wrapper. The summary is appended in Error() without mutating the underlying
+// cause's fields.
+type routeExhaustionClonedError struct {
 	cause   error
 	summary string
 }
@@ -129,25 +135,13 @@ func wrapRouteExhaustion(cause error, tracker *routeAttemptTracker) error {
 	if summary == "" {
 		return cause
 	}
-	var authErr *Error
-	if errors.As(cause, &authErr) && authErr != nil {
-		cloned := *authErr
-		if cloned.Message != "" {
-			cloned.Message = cloned.Message + "; " + summary
-		} else if cloned.Code != "" {
-			cloned.Message = cloned.Code + "; " + summary
-		} else {
-			cloned.Message = summary
-		}
-		return &cloned
-	}
-	return &routeExhaustionError{
+	return &routeExhaustionClonedError{
 		cause:   cause,
 		summary: summary,
 	}
 }
 
-func (e *routeExhaustionError) Error() string {
+func (e *routeExhaustionClonedError) Error() string {
 	if e == nil {
 		return ""
 	}
@@ -160,9 +154,34 @@ func (e *routeExhaustionError) Error() string {
 	return e.cause.Error() + "; " + e.summary
 }
 
-func (e *routeExhaustionError) Unwrap() error {
+func (e *routeExhaustionClonedError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.cause
+}
+
+// Headers forwards the wrapped cause's error headers if it exposes them, so
+// handlers that collect passthrough headers from the final routed error do not
+// lose them when the cause is wrapped by route exhaustion. It returns the
+// first/outermost carrier per errors.As and a fresh copy of its map, never
+// mutating the caller's or cause's headers.
+func (e *routeExhaustionClonedError) Headers() http.Header {
+	if e == nil {
+		return nil
+	}
+	var carrier interface{ Headers() http.Header }
+	if errors.As(e.cause, &carrier) && carrier != nil {
+		return cloneHTTPHeader(carrier.Headers())
+	}
+	return nil
+}
+
+// SafeResponseHeaders forwards the trusted Home busy response headers from the
+// underlying cause, nil-safe for the wrapper receiver.
+func (e *routeExhaustionClonedError) SafeResponseHeaders() http.Header {
+	if e == nil {
+		return nil
+	}
+	return SafeResponseHeaders(e.cause)
 }

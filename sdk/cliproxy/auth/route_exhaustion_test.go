@@ -461,3 +461,302 @@ func TestRouteExhaustion_HomeNoModelDiagnostic(t *testing.T) {
 		}
 	}
 }
+
+// routeExhaustionHeaderCause is a generic non-*Error cause that exposes
+// headers the same way upstream errors (streamBootstrapError,
+// modelCooldownError) do, so handlers collecting passthrough headers from the
+// final routed error can still surface them through route exhaustion.
+type routeExhaustionHeaderCause struct {
+	msg     string
+	headers http.Header
+}
+
+func (e *routeExhaustionHeaderCause) Error() string { return e.msg }
+func (e *routeExhaustionHeaderCause) Headers() http.Header {
+	return e.headers.Clone()
+}
+
+// routeExhaustionNoHeaderCause is a generic non-*Error cause that exposes no
+// headers, mirroring ordinary upstream failures.
+type routeExhaustionNoHeaderCause struct{ msg string }
+
+func (e *routeExhaustionNoHeaderCause) Error() string { return e.msg }
+
+// I. Wrapper contract: a wrapped cause exposing headers retains them, while
+// Error/Unwrap and the sanitized route summary stay intact.
+func TestRouteExhaustion_HeadersForwarded(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "gemini"}, &Error{HTTPStatus: 429})
+
+	cause := &routeExhaustionHeaderCause{
+		msg:     "upstream retry-after",
+		headers: http.Header{"Retry-After": {"1"}, "X-Request-Id": {"req-123"}},
+	}
+	err := wrapRouteExhaustion(cause, tracker)
+
+	// errors.As / errors.Is must still traverse the wrapper.
+	var unwrapped *routeExhaustionHeaderCause
+	if !errors.As(err, &unwrapped) || unwrapped == nil {
+		t.Fatalf("errors.As(*routeExhaustionHeaderCause) failed, err=%v", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("errors.Is(err, cause) = false")
+	}
+
+	// Sanitized route summary retained.
+	if !strings.Contains(err.Error(), "attempted routes: [gemini") {
+		t.Errorf("unexpected error string, summary missing routes: %s", err.Error())
+	}
+
+	// Headers readable via the same assertion handlers use; values exact.
+	he, ok := err.(interface{ Headers() http.Header })
+	if !ok || he == nil {
+		t.Fatalf("routeExhaustionClonedError must implement Headers(), err=%T", err)
+	}
+	hdr := he.Headers()
+	if hdr.Get("Retry-After") != "1" {
+		t.Errorf("Headers().Get(Retry-After) = %q, want 1", hdr.Get("Retry-After"))
+	}
+	if hdr.Get("X-Request-Id") != "req-123" {
+		t.Errorf("Headers().Get(X-Request-Id) = %q, want req-123", hdr.Get("X-Request-Id"))
+	}
+
+	// Forwarded map is a copy: mutating it must not touch the caller's map.
+	hdr.Set("Retry-After", "999")
+	if cause.headers.Get("Retry-After") != "1" {
+		t.Errorf("wrapped headers mutated caller map: got %q", cause.headers.Get("Retry-After"))
+	}
+}
+
+// J. Wrapper contract: a cause without Headers yields nil, matching the
+// convention other header-carriers follow for absent headers.
+func TestRouteExhaustion_HeadersAbsentNil(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "openai"}, &Error{HTTPStatus: 502})
+
+	err := wrapRouteExhaustion(&routeExhaustionNoHeaderCause{msg: "502 Bad Gateway"}, tracker)
+
+	he, ok := err.(interface{ Headers() http.Header })
+	if !ok || he == nil {
+		t.Fatalf("routeExhaustionClonedError must implement Headers(), err=%T", err)
+	}
+	if got := he.Headers(); got != nil {
+		t.Errorf("Headers() = %v, want nil for cause without headers", got)
+	}
+}
+
+// K. Stream-level: headers reach the returned route-exhaustion error so the
+// stream/error handlers can surface passthrough headers.
+func TestRouteExhaustion_ExecuteStreamHeaders(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetRetryConfig(3, 5*time.Second, 3)
+
+	exec := newRouteExhaustionTestExecutor("claude")
+	mgr.RegisterExecutor(exec)
+
+	model := "stream-hdr-model-" + uuid.NewString()
+	authID := registerRouteTestAuth(t, mgr, "claude", model, nil)
+	exec.failErrors[authID] = &routeExhaustionHeaderCause{
+		msg:     "429 Too Many Requests",
+		headers: http.Header{"Retry-After": {"1"}, "X-Request-Id": {"req-777"}},
+	}
+
+	_, err := mgr.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatalf("ExecuteStream() expected error on route exhaustion")
+	}
+	if !strings.Contains(err.Error(), "attempted routes: [claude") {
+		t.Errorf("ExecuteStream error missing route summary: %v", err)
+	}
+
+	he, ok := err.(interface{ Headers() http.Header })
+	if !ok || he == nil {
+		t.Fatalf("ExecuteStream() error must implement Headers(), got %T", err)
+	}
+	hdr := he.Headers()
+	if hdr.Get("Retry-After") != "1" {
+		t.Errorf("Headers().Get(Retry-After) = %q, want 1", hdr.Get("Retry-After"))
+	}
+	if hdr.Get("X-Request-Id") != "req-777" {
+		t.Errorf("Headers().Get(X-Request-Id) = %q, want req-777", hdr.Get("X-Request-Id"))
+	}
+}
+
+// routeExhaustionNestedCause is a header-carrier that also unwraps to an inner
+// header-carrier, so the first/outermost carrier must win per errors.As.
+type routeExhaustionNestedCause struct {
+	inner   *routeExhaustionHeaderCause
+	headers http.Header
+}
+
+func (e *routeExhaustionNestedCause) Error() string        { return "outer wrapped cause" }
+func (e *routeExhaustionNestedCause) Unwrap() error        { return e.inner }
+func (e *routeExhaustionNestedCause) Headers() http.Header { return e.headers }
+
+// L. Wrapper contract: nil receiver returns nil, not a panic.
+func TestRouteExhaustion_HeadersNilReceiver(t *testing.T) {
+	var e *routeExhaustionClonedError
+	if hdr := e.Headers(); hdr != nil {
+		t.Errorf("Headers() = %v, want nil for nil receiver", hdr)
+	}
+}
+
+// M. Wrapper contract: errors.As starts at the cause and returns the
+// first/outermost carrier; an inner carrier must not shadow it, and the
+// forwarded map is a fresh clone even when the outer carrier returns raw.
+func TestRouteExhaustion_HeadersNestedOutermostWins(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "gemini"}, &Error{HTTPStatus: 429})
+
+	inner := &routeExhaustionHeaderCause{
+		msg:     "inner retry-after",
+		headers: http.Header{"Retry-After": {"inner"}, "Inner": {"1"}},
+	}
+	outer := &routeExhaustionNestedCause{
+		inner:   inner,
+		headers: http.Header{"Retry-After": {"outer"}, "Outer": {"1"}},
+	}
+	err := wrapRouteExhaustion(outer, tracker)
+
+	he, ok := err.(interface{ Headers() http.Header })
+	if !ok || he == nil {
+		t.Fatalf("routeExhaustionClonedError must implement Headers(), err=%T", err)
+	}
+	hdr := he.Headers()
+	if hdr.Get("Retry-After") != "outer" {
+		t.Errorf("Headers().Get(Retry-After) = %q, want outer", hdr.Get("Retry-After"))
+	}
+	if hdr.Get("Outer") != "1" {
+		t.Errorf("Headers().Get(Outer) = %q, want 1", hdr.Get("Outer"))
+	}
+	if hdr.Get("Inner") != "" {
+		t.Errorf("headers from inner carrier leaked, outermost must win: %q", hdr.Get("Inner"))
+	}
+
+	// The inner carrier remains reachable through the Unwrap chain.
+	var unwrapped *routeExhaustionHeaderCause
+	if !errors.As(err, &unwrapped) || unwrapped == nil {
+		t.Fatalf("errors.As(*routeExhaustionHeaderCause) failed, err=%v", err)
+	}
+
+	// Forwarded map is a fresh clone of the outer cause's raw map.
+	hdr.Set("Retry-After", "999")
+	if outer.headers.Get("Retry-After") != "outer" {
+		t.Errorf("wrapped headers mutated caller map: got %q", outer.headers.Get("Retry-After"))
+	}
+	if inner.headers.Get("Retry-After") != "inner" {
+		t.Errorf("inner caller map mutated: got %q", inner.headers.Get("Retry-After"))
+	}
+}
+
+// N. Approach B: a wrapped Home busy cause keeps its typed identity, Retry-After
+// stays discoverable through the wrapper, SafeResponseHeaders surfaces the
+// trusted header, and the route summary is still appended.
+func TestRouteExhaustion_HomeBusyRetryAfterAndTypedCause(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "gemini"}, &Error{HTTPStatus: 429})
+
+	cause := NewHomeConcurrencyBusyError("credential busy", 750*time.Millisecond)
+	err := wrapRouteExhaustion(cause, tracker)
+
+	var busy *HomeConcurrencyBusyError
+	if !errors.As(err, &busy) || busy == nil {
+		t.Fatalf("errors.As(*HomeConcurrencyBusyError) failed, err=%v", err)
+	}
+	if got := retryAfterFromError(err); got == nil || *got != 750*time.Millisecond {
+		t.Fatalf("retryAfterFromError(err) = %v, want 750ms", got)
+	}
+	if hdr := SafeResponseHeaders(err); hdr == nil || hdr.Get("Retry-After") != "1" {
+		t.Fatalf("SafeResponseHeaders(err) = %v, want Retry-After 1", hdr)
+	}
+	if !strings.Contains(err.Error(), "attempted routes: [gemini") {
+		t.Errorf("route summary missing from wrapped home busy error: %s", err.Error())
+	}
+}
+
+// O. Approach B: wrapping a concrete *Error cause must not clone or mutate it;
+// the cause's Message and Error() text stay byte-identical.
+func TestRouteExhaustion_MessageNotMutated(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "openai"}, &Error{HTTPStatus: 502})
+
+	cause := &Error{Code: "bad_gateway", Message: "502 Bad Gateway", HTTPStatus: 502}
+	err := wrapRouteExhaustion(cause, tracker)
+
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		t.Fatalf("errors.As(*Error) failed, err=%v", err)
+	}
+	if authErr.Message != "502 Bad Gateway" {
+		t.Fatalf("cause Message mutated: got %q, want %q", authErr.Message, "502 Bad Gateway")
+	}
+	if authErr.Error() != "bad_gateway: 502 Bad Gateway" {
+		t.Fatalf("cause Error() altered: got %q", authErr.Error())
+	}
+	if !strings.HasSuffix(err.Error(), "; attempted routes: [openai:502]") {
+		t.Fatalf("wrapper should append summary to unmutated cause text: %s", err.Error())
+	}
+}
+
+// P. Approach B: the sanitized route summary appears exactly once in the
+// wrapper error, even when the cause itself is a *Error.
+func TestRouteExhaustion_SummaryAppendedExactlyOnce(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "openai"}, &Error{HTTPStatus: 502})
+
+	cause := &Error{Code: "bad_gateway", Message: "502 Bad Gateway", HTTPStatus: 502}
+	err := wrapRouteExhaustion(cause, tracker)
+
+	errStr := err.Error()
+	if count := strings.Count(errStr, "attempted routes:"); count != 1 {
+		t.Fatalf("summary appeared %d times in error, want exactly once: %s", count, errStr)
+	}
+	if count := strings.Count(errStr, "; attempted routes:"); count != 1 {
+		t.Fatalf("summary separator `; attempted routes:` appeared %d times, want exactly once: %s", count, errStr)
+	}
+}
+
+// Q. Approach B: SafeResponseHeaders is nil-safe on a nil wrapper receiver.
+func TestRouteExhaustion_SafeResponseHeadersNilReceiver(t *testing.T) {
+	var e *routeExhaustionClonedError
+	if hdr := e.SafeResponseHeaders(); hdr != nil {
+		t.Errorf("SafeResponseHeaders() = %v, want nil for nil receiver", hdr)
+	}
+	if hdr := SafeResponseHeaders(nil); hdr != nil {
+		t.Errorf("SafeResponseHeaders(nil) = %v, want nil", hdr)
+	}
+}
+
+// R. Approach B: for a generic (non-*Error) cause chain, Headers forwards the
+// first/outermost carrier per errors.As and returns a fresh clone, never the
+// cause's own map reference.
+func TestRouteExhaustion_GenericOutermostHeadersClone(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "gemini"}, &Error{HTTPStatus: 429})
+
+	inner := &routeExhaustionHeaderCause{
+		msg:     "inner",
+		headers: http.Header{"Inner": {"1"}},
+	}
+	outer := &routeExhaustionNestedCause{
+		inner:   inner,
+		headers: http.Header{"Retry-After": {"outer"}, "Outer": {"1"}},
+	}
+	err := wrapRouteExhaustion(outer, tracker)
+
+	he, ok := err.(interface{ Headers() http.Header })
+	if !ok || he == nil {
+		t.Fatalf("routeExhaustionClonedError must implement Headers(), err=%T", err)
+	}
+	hdr := he.Headers()
+	if hdr.Get("Retry-After") != "outer" || hdr.Get("Inner") != "" {
+		t.Fatalf("outermost carrier did not win over inner, got %v", hdr)
+	}
+	hdr.Set("Retry-After", "999")
+	if outer.headers.Get("Retry-After") != "outer" {
+		t.Fatalf("wrapped headers mutated caller map: got %q", outer.headers.Get("Retry-After"))
+	}
+	if inner.headers.Get("Inner") != "1" {
+		t.Fatalf("inner caller map mutated: got %q", inner.headers.Get("Inner"))
+	}
+}

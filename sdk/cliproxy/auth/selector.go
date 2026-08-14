@@ -248,38 +248,6 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-// excludedAuthIDsFromOptions extracts the request-scoped set of auth IDs that
-// already failed (429/5xx/empty) within the current request and must not be
-// re-selected. Supports map[string]struct{} or []string metadata values.
-func excludedAuthIDsFromOptions(opts cliproxyexecutor.Options) map[string]struct{} {
-	if opts.Metadata == nil {
-		return nil
-	}
-	raw, ok := opts.Metadata[cliproxyexecutor.ExcludedAuthIDsMetadataKey]
-	if !ok || raw == nil {
-		return nil
-	}
-	switch v := raw.(type) {
-	case map[string]struct{}:
-		return v
-	case map[string]bool:
-		set := make(map[string]struct{}, len(v))
-		for id, ex := range v {
-			if ex {
-				set[id] = struct{}{}
-			}
-		}
-		return set
-	case []string:
-		set := make(map[string]struct{}, len(v))
-		for _, id := range v {
-			set[id] = struct{}{}
-		}
-		return set
-	}
-	return nil
-}
-
 func collectAvailableByPriority(auths []*Auth, model string, now time.Time, excluded map[string]struct{}) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
@@ -409,7 +377,7 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, excludedAuthIDsFromOptions(opts))
+	available, err := getAvailableAuths(auths, provider, model, now, extractExcludedAuthIDs(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +423,7 @@ func positiveWeightAuths(auths []*Auth) []*Auth {
 // Pick selects the next available auth using smooth weighted round-robin.
 func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now(), excludedAuthIDsFromOptions(opts))
+	available, errAvailable := getAvailableAuths(positiveWeightAuths(auths), provider, model, time.Now(), extractExcludedAuthIDs(opts.Metadata))
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
@@ -565,7 +533,7 @@ func saturatingAddInt64(value, delta int64) int64 {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now, excludedAuthIDsFromOptions(opts))
+	available, err := getAvailableAuths(auths, provider, model, now, extractExcludedAuthIDs(opts.Metadata))
 	if err != nil {
 		return nil, err
 	}
@@ -704,7 +672,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
-	excluded := excludedAuthIDsFromOptions(opts)
+	excluded := extractExcludedAuthIDs(opts.Metadata)
 	availabilityCandidates := auths
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
@@ -739,6 +707,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
+	rebindAliases := make([]string, 0, 2)
+	addRebind := func(aliases ...string) {
+		rebindAliases = mergeSessionAliases(rebindAliases, aliases...)
+	}
 	pickCached := func() *Auth {
 		if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 			for _, auth := range available {
@@ -747,7 +719,11 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					return auth
 				}
 			}
-			s.cache.CompareAndDelete(cacheKey, cachedAuthID)
+			// The cached auth is no longer selectable. Atomically collect the
+			// whole alias group (pck primary + conv fallback and any shared
+			// prompt aliases) so a stale single-key delete cannot strand sibling
+			// aliases, then rebind every one to the replacement auth below.
+			addRebind(s.cache.CompareAndDeleteAliases(cacheKey, cachedAuthID)...)
 		}
 		if fallbackKey != "" {
 			if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
@@ -757,7 +733,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 						return auth
 					}
 				}
-				s.cache.CompareAndDelete(fallbackKey, cachedAuthID)
+				addRebind(s.cache.CompareAndDeleteAliases(fallbackKey, cachedAuthID)...)
 			}
 		}
 		return nil
@@ -779,7 +755,10 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	bind(auth.ID)
-	entry.Infof("session-affinity: cache miss, bound candidate | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+	if len(rebindAliases) > 0 {
+		s.cache.SetAliases(auth.ID, rebindAliases...)
+	}
+	entry.Infof("session-affinity: cache miss, rebound candidate | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }
 

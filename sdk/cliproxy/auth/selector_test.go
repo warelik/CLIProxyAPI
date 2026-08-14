@@ -967,6 +967,132 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 		}
 	}
 }
+func TestSessionAffinitySelector_CachedAuthUnavailableRebindsWholeAliasGroupRebindAliases(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	provider := "responses-cache-rebound"
+	model := "gpt-test"
+
+	combined := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`)}
+	first, err := selector.Pick(context.Background(), provider, model, combined, auths)
+	if err != nil {
+		t.Fatalf("Pick() combined error = %v", err)
+	}
+	if first.ID != "auth-a" {
+		t.Fatalf("first Pick() = %q, want auth-a", first.ID)
+	}
+	selector.OnResult(Result{AuthID: first.ID, Provider: provider, Model: model, Options: combined, Success: true})
+
+	availableWithoutFirst := []*Auth{{ID: "auth-b"}}
+	for _, payload := range []struct {
+		name    string
+		request []byte
+	}{
+		{name: "primary prompt", request: []byte(`{"prompt_cache_key":"shared-cache-bucket"}`)},
+		{name: "fallback conversation", request: []byte(`{"conversation":{"id":"conversation-session"}}`)},
+	} {
+		opts := cliproxyexecutor.Options{OriginalRequest: payload.request}
+		picked, err := selector.Pick(context.Background(), provider, model, opts, availableWithoutFirst)
+		if err != nil {
+			t.Fatalf("%s Pick() error = %v", payload.name, err)
+		}
+		if picked.ID != "auth-b" {
+			t.Fatalf("%s alias selected %q, want rebound %q", payload.name, picked.ID, "auth-b")
+		}
+		selector.OnResult(Result{AuthID: picked.ID, Provider: provider, Model: model, Options: opts, Success: true})
+	}
+}
+
+func TestSessionAffinitySelector_CachedAuthUnavailableRebindsSharedPromptGroup(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	provider := "responses-cache-rebound-shared"
+	model := "gpt-test"
+
+	combinedA := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conversation-a"},"prompt_cache_key":"shared-cache-bucket"}`)}
+	combinedB := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conversation-b"},"prompt_cache_key":"shared-cache-bucket"}`)}
+	first, err := selector.Pick(context.Background(), provider, model, combinedA, auths)
+	if err != nil {
+		t.Fatalf("Pick() A error = %v", err)
+	}
+	selector.OnResult(Result{AuthID: first.ID, Provider: provider, Model: model, Options: combinedA, Success: true})
+	if first.ID != "auth-a" {
+		t.Fatalf("first Pick() = %q, want auth-a", first.ID)
+	}
+	second, err := selector.Pick(context.Background(), provider, model, combinedB, auths)
+	if err != nil {
+		t.Fatalf("Pick() B error = %v", err)
+	}
+	selector.OnResult(Result{AuthID: second.ID, Provider: provider, Model: model, Options: combinedB, Success: true})
+	if second.ID != first.ID {
+		t.Fatalf("shared prompt key changed auth from %q to %q", first.ID, second.ID)
+	}
+
+	availableWithoutFirst := []*Auth{{ID: "auth-b"}}
+	for _, payload := range []struct {
+		name    string
+		request []byte
+	}{
+		{name: "conversation A", request: []byte(`{"conversation":{"id":"conversation-a"}}`)},
+		{name: "conversation B", request: []byte(`{"conversation":{"id":"conversation-b"}}`)},
+	} {
+		opts := cliproxyexecutor.Options{OriginalRequest: payload.request}
+		picked, err := selector.Pick(context.Background(), provider, model, opts, availableWithoutFirst)
+		if err != nil {
+			t.Fatalf("%s Pick() error = %v", payload.name, err)
+		}
+		if picked.ID != "auth-b" {
+			t.Fatalf("%s alias selected %q, want rebound %q", payload.name, picked.ID, "auth-b")
+		}
+		selector.OnResult(Result{AuthID: picked.ID, Provider: provider, Model: model, Options: opts, Success: true})
+	}
+}
+
+func TestSessionAffinitySelector_CachedAuthUnavailableConcurrencyNewerBinding(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	provider := "responses-cache-rebound-concurrent"
+	model := "gpt-test"
+
+	combined := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`)}
+	first, err := selector.Pick(context.Background(), provider, model, combined, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	selector.OnResult(Result{AuthID: first.ID, Provider: provider, Model: model, Options: combined, Success: true})
+
+	availableWithoutFirst := []*Auth{{ID: "auth-b"}}
+	picked, err := selector.Pick(context.Background(), provider, model, combined, availableWithoutFirst)
+	if err != nil {
+		t.Fatalf("unavailable Pick() error = %v", err)
+	}
+	selector.OnResult(Result{AuthID: picked.ID, Provider: provider, Model: model, Options: combined, Success: true})
+	if picked.ID != "auth-b" {
+		t.Fatalf("unavailable Pick() = %q, want auth-b", picked.ID)
+	}
+
+	for i := 0; i < 5; i++ {
+		got, err := selector.Pick(context.Background(), provider, model, combined, availableWithoutFirst)
+		if err != nil {
+			t.Fatalf("concurrent Pick() #%d error = %v", i, err)
+		}
+		if got.ID != "auth-b" {
+			t.Fatalf("concurrent Pick() #%d = %q, want auth-b (newer binding preserved)", i, got.ID)
+		}
+	}
+}
 
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()

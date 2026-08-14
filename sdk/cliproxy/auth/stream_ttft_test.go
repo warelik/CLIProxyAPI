@@ -267,6 +267,34 @@ func TestStreamFirstChunkTimeout_ConfigAndMetadata(t *testing.T) {
 	}
 }
 
+// TestStreamFirstChunkTimeout_UnsupportedKeysIgnored proves the undocumented
+// duration form and _seconds key are no longer accepted; only _ms is honored
+// with the config fallback verified separately in ConfigAndMetadata.
+func TestStreamFirstChunkTimeout_UnsupportedKeysIgnored(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			"stream_first_chunk_timeout":         time.Second,
+			"stream_first_chunk_timeout_seconds": 2,
+			"stream_first_chunk_timeout_ms":      40,
+		},
+	}
+	if got := m.streamFirstChunkTimeout(opts); got != 40*time.Millisecond {
+		t.Fatalf("metadata with unsupported keys = %v, want 40ms from _ms", got)
+	}
+
+	onlyUnsupported := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			"stream_first_chunk_timeout":         time.Second,
+			"stream_first_chunk_timeout_seconds": 7,
+		},
+	}
+	if got := m.streamFirstChunkTimeout(onlyUnsupported); got != 0 {
+		t.Fatalf("only unsupported metadata keys = %v, want 0 (disabled)", got)
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstr(s, substr))
 }

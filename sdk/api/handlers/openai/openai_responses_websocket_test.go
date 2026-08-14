@@ -3157,6 +3157,166 @@ func TestResponsesWebsocketExposesCyberPolicyRegardlessOfStatus(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketRebuildsErrorPayloadWithoutRawEcho(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name            string
+		errMsg          func() *interfaces.ErrorMessage
+		wantStatus      int
+		wantType        string
+		wantErrorType   string
+		wantCode        string
+		wantMessageSub  string
+		rejectSecretSub string
+	}{
+		{
+			name: "in-band upstream error with nested secret is redacted and bounded",
+			errMsg: func() *interfaces.ErrorMessage {
+				return &interfaces.ErrorMessage{
+					StatusCode: http.StatusBadGateway,
+					Error:      errors.New(`{"type":"error","error":{"type":"server_error","code":"upstream_failed","message":"provider failed: {\"api_key\":\"ws-inband-secret\"}","debug":{"token":"ws-inband-secret"}}}`),
+				}
+			},
+			wantStatus:      http.StatusBadGateway,
+			wantType:        "error",
+			wantErrorType:   "server_error",
+			wantCode:        "upstream_failed",
+			wantMessageSub:  "[REDACTED]",
+			rejectSecretSub: "ws-inband-secret",
+		},
+		{
+			name: "malformed json falls back to bounded server_error without raw echo",
+			errMsg: func() *interfaces.ErrorMessage {
+				return &interfaces.ErrorMessage{
+					StatusCode: http.StatusInternalServerError,
+					Error:      errors.New(`{"type":"error","error":{"secret":"malformed-ws-secret","code":`),
+				}
+			},
+			wantStatus:      http.StatusInternalServerError,
+			wantType:        "error",
+			wantErrorType:   "server_error",
+			rejectSecretSub: "malformed-ws-secret",
+		},
+		{
+			name: "nil error message defaults safely",
+			errMsg: func() *interfaces.ErrorMessage {
+				return nil
+			},
+			wantStatus:    http.StatusInternalServerError,
+			wantType:      "error",
+			wantErrorType: "server_error",
+		},
+		{
+			name: "invalid status normalized",
+			errMsg: func() *interfaces.ErrorMessage {
+				return &interfaces.ErrorMessage{
+					StatusCode: http.StatusOK,
+					Error:      errors.New("bad status"),
+				}
+			},
+			wantStatus:     http.StatusInternalServerError,
+			wantType:       "error",
+			wantErrorType:  "server_error",
+			wantMessageSub: "bad status",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := buildResponsesWebsocketErrorPayload(tc.errMsg())
+			if err != nil {
+				t.Fatalf("buildResponsesWebsocketErrorPayload: %v", err)
+			}
+			if got := gjson.GetBytes(payload, "type").String(); got != tc.wantType {
+				t.Fatalf("type = %q, want %q: %s", got, tc.wantType, payload)
+			}
+			if got := int(gjson.GetBytes(payload, "status").Int()); got != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", got, tc.wantStatus, payload)
+			}
+			if tc.wantErrorType != "" {
+				if got := gjson.GetBytes(payload, "error.type").String(); got != tc.wantErrorType {
+					t.Fatalf("error.type = %q, want %q: %s", got, tc.wantErrorType, payload)
+				}
+			}
+			if got := gjson.GetBytes(payload, "error.code").String(); got != tc.wantCode {
+				t.Fatalf("error.code = %q, want %q: %s", got, tc.wantCode, payload)
+			}
+			if tc.rejectSecretSub != "" && strings.Contains(string(payload), tc.rejectSecretSub) {
+				t.Fatalf("raw secret echoed: %s", payload)
+			}
+			if tc.wantMessageSub != "" {
+				message := gjson.GetBytes(payload, "error.message").String()
+				if !strings.Contains(message, tc.wantMessageSub) {
+					t.Fatalf("error.message = %q, want substring %q: %s", message, tc.wantMessageSub, payload)
+				}
+			}
+			if len(payload) > 4096 {
+				t.Fatalf("error payload unbounded: len=%d", len(payload))
+			}
+		})
+	}
+}
+
+func TestResponsesWebsocketRebuildsInBandErrorPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"cyber_policy","message":"blocked"}}`)
+		close(data)
+		close(errCh)
+
+		_, _, _, _, errForward := (*OpenAIResponsesAPIHandler)(nil).forwardResponsesWebsocket(
+			ctx,
+			newResponsesWebsocketWriter(conn),
+			func(...interface{}) {},
+			data,
+			errCh,
+			nil,
+			"session-1",
+		)
+		if errForward != nil && !errors.Is(errForward, websocket.ErrCloseSent) {
+			serverErrCh <- errForward
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket message: %v", errRead)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != "error" {
+		t.Fatalf("type = %q, want error: %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "error.code").String(); got != "cyber_policy" {
+		t.Fatalf("error.code = %q, want cyber_policy: %s", got, payload)
+	}
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
 func TestResponsesWebsocketTerminalErrorWrittenOnceAcrossForwardAndDisconnect(t *testing.T) {
 	serverErrCh := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3182,7 +3342,7 @@ func TestResponsesWebsocketTerminalErrorWrittenOnceAcrossForwardAndDisconnect(t 
 		go func() {
 			defer wg.Done()
 			<-start
-			payload, _, errWrite := writeResponsesWebsocketTerminalError(writer, nil, errMsg, nil)
+			payload, _, errWrite := writeResponsesWebsocketTerminalError(writer, nil, errMsg)
 			if !errors.Is(errWrite, websocket.ErrCloseSent) || gjson.GetBytes(payload, "error.code").String() != "cyber_policy" {
 				resultCh <- fmt.Errorf("err-channel terminal write failed: err=%v payload=%s", errWrite, payload)
 			}
@@ -3190,10 +3350,9 @@ func TestResponsesWebsocketTerminalErrorWrittenOnceAcrossForwardAndDisconnect(t 
 		go func() {
 			defer wg.Done()
 			<-start
-			payload := []byte(`{"type":"error","status":400,"error":{"type":"invalid_request","code":"cyber_policy","message":"blocked"}}`)
-			writtenPayload, _, errWrite := writeResponsesWebsocketTerminalError(writer, nil, errMsg, payload)
+			writtenPayload, _, errWrite := writeResponsesWebsocketTerminalError(writer, nil, errMsg)
 			if !errors.Is(errWrite, websocket.ErrCloseSent) || gjson.GetBytes(writtenPayload, "error.code").String() != "cyber_policy" {
-				resultCh <- fmt.Errorf("payload terminal write failed: err=%v payload=%s", errWrite, writtenPayload)
+				resultCh <- fmt.Errorf("terminal write failed: err=%v payload=%s", errWrite, writtenPayload)
 			}
 		}()
 		go func() {

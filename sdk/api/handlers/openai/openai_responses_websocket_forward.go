@@ -80,7 +80,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, websocket.ErrCloseSent
 			}
 
-			errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg, nil)
+			errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg)
 			if wrote {
 				log.Infof(
 					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
@@ -149,7 +149,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						}
 						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, websocket.ErrCloseSent
 					}
-					errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, payloadErrMsg, payloads[i])
+					errorPayload, wrote, errTerminate := writeResponsesWebsocketTerminalError(writer, wsTimelineLog, payloadErrMsg)
 					if wrote {
 						log.Infof(
 							"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
@@ -213,7 +213,6 @@ func writeResponsesWebsocketTerminalError(
 	writer *responsesWebsocketWriter,
 	wsTimelineLog websocketTimelineAppender,
 	errMsg *interfaces.ErrorMessage,
-	payload []byte,
 ) ([]byte, bool, error) {
 	if !shouldExposeResponsesUpstreamError(errMsg) {
 		// Keep the upstream reason in the request-log timeline even though the client
@@ -229,13 +228,10 @@ func writeResponsesWebsocketTerminalError(
 		return nil, false, websocket.ErrCloseSent
 	}
 
-	if len(payload) == 0 {
-		var errBuild error
-		payload, errBuild = buildResponsesWebsocketErrorPayload(errMsg)
-		if errBuild != nil {
-			_, _ = writer.closeWithoutError()
-			return nil, false, errBuild
-		}
+	payload, errBuild := buildResponsesWebsocketErrorPayload(errMsg)
+	if errBuild != nil {
+		_, _ = writer.closeWithoutError()
+		return nil, false, errBuild
 	}
 
 	wrote, errClose := writer.closeWithPayload(payload)
@@ -527,18 +523,13 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 
 func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
-	errText := http.StatusText(status)
-	if errMsg != nil {
-		if errMsg.StatusCode > 0 {
-			status = errMsg.StatusCode
-			errText = http.StatusText(status)
-		}
-		if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
-			errText = errMsg.Error.Error()
-		}
+	if errMsg != nil && errMsg.StatusCode > 0 {
+		status = errMsg.StatusCode
+	}
+	if status < http.StatusBadRequest || status > 599 {
+		status = http.StatusInternalServerError
 	}
 
-	body := handlers.BuildErrorResponseBody(status, errText)
 	payload := []byte(`{}`)
 	var errSet error
 	payload, errSet = sjson.SetBytes(payload, "type", wsEventTypeError)
@@ -550,49 +541,27 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 		return nil, errSet
 	}
 
-	if errMsg != nil && errMsg.Addon != nil {
-		headers := []byte(`{}`)
-		hasHeaders := false
-		for key, values := range errMsg.Addon {
-			if len(values) == 0 {
-				continue
-			}
-			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			headers, errSet = sjson.SetBytes(headers, headerPath, values[0])
-			if errSet != nil {
-				return nil, errSet
-			}
-			hasHeaders = true
+	// Rebuild the error object through the shared structured sanitizer so only
+	// safe protocol fields (type/code/message/param), redacted and bounded, ever
+	// reach the downstream client. Raw upstream body and header bytes are never
+	// echoed.
+	if errText := responsesStreamErrorText(errMsg, status); json.Valid([]byte(errText)) {
+		node := gjson.Parse(errText).Get("error")
+		if node.Exists() && node.IsObject() {
+			payload, errSet = sjson.SetRawBytes(payload, "error", []byte(node.Raw))
+			return payload, errSet
 		}
-		if hasHeaders {
-			payload, errSet = sjson.SetRawBytes(payload, "headers", headers)
-			if errSet != nil {
-				return nil, errSet
-			}
-		}
+		payload, errSet = sjson.SetBytes(payload, "error.message", truncateResponsesStreamErrorText(redactResponsesStreamErrorText(errText), responsesStreamErrorMessageLimit))
+		return payload, errSet
 	}
 
-	if len(body) > 0 && json.Valid(body) {
-		errorNode := gjson.GetBytes(body, "error")
-		if errorNode.Exists() {
-			payload, errSet = sjson.SetRawBytes(payload, "error", []byte(errorNode.Raw))
-		} else {
-			payload, errSet = sjson.SetRawBytes(payload, "error", body)
-		}
-		if errSet != nil {
-			return nil, errSet
-		}
+	payload, errSet = sjson.SetBytes(payload, "error.type", "server_error")
+	if errSet != nil {
+		return nil, errSet
 	}
-
-	if !gjson.GetBytes(payload, "error").Exists() {
-		payload, errSet = sjson.SetBytes(payload, "error.type", "server_error")
-		if errSet != nil {
-			return nil, errSet
-		}
-		payload, errSet = sjson.SetBytes(payload, "error.message", errText)
-		if errSet != nil {
-			return nil, errSet
-		}
+	payload, errSet = sjson.SetBytes(payload, "error.message", truncateResponsesStreamErrorText(redactResponsesStreamErrorText(responsesStreamErrorText(errMsg, status)), responsesStreamErrorMessageLimit))
+	if errSet != nil {
+		return nil, errSet
 	}
 
 	return payload, nil

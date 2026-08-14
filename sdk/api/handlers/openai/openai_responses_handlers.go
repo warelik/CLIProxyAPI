@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -1123,10 +1124,17 @@ func responsesStreamErrorText(errMsg *interfaces.ErrorMessage, status int) strin
 }
 
 type responsesStreamSanitizedError struct {
-	message string
+	message     string
+	safeHeaders http.Header
 }
 
 func (e *responsesStreamSanitizedError) Error() string { return e.message }
+func (e *responsesStreamSanitizedError) SafeResponseHeaders() http.Header {
+	if e == nil || e.safeHeaders == nil {
+		return nil
+	}
+	return e.safeHeaders.Clone()
+}
 
 func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
 	if errMsg == nil {
@@ -1138,7 +1146,10 @@ func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *inter
 	}
 	safe := *errMsg
 	safe.StatusCode = status
-	safe.Error = &responsesStreamSanitizedError{message: responsesStreamErrorText(errMsg, status)}
+	safe.Error = &responsesStreamSanitizedError{
+		message:     responsesStreamErrorText(errMsg, status),
+		safeHeaders: coreauth.SafeResponseHeaders(errMsg.Error),
+	}
 	safe.DirectResponse = false
 	safe.Body = nil
 	return &safe

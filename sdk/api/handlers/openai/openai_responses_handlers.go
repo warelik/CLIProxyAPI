@@ -1131,7 +1131,7 @@ func (e *responsesStreamSanitizedError) Error() string { return e.message }
 func (e *responsesStreamSanitizedError) Unwrap() error { return e.cause }
 
 func sanitizeResponsesInitialErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
-	if errMsg != nil && errMsg.DirectResponse {
+	if errMsg != nil && errMsg.DirectResponse && errMsg.TrustedDirectResponse {
 		return errMsg
 	}
 	return sanitizeResponsesStreamErrorMessage(errMsg)
@@ -1154,15 +1154,15 @@ func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *inter
 }
 
 // sanitizeOpenAIErrorMessage is the strict trust-boundary sanitizer shared by
-// the OpenAI Responses/Images/Videos handlers. It always sanitizes, unlike
-// sanitizeResponsesInitialErrorMessage which preserves DirectResponse: the
-// non-stream upstream error paths (client body + request/error logging) must
-// never emit a raw upstream ErrorMessage, Body, or unsafe DirectResponse flag.
-// It clears Body and forces DirectResponse=false exactly as the streaming
-// helper does, and returns nil for a nil input.
+// the OpenAI Responses/Images/Videos handlers. It preserves a DirectResponse
+// only when it is explicitly trusted; otherwise it sanitizes like the
+// streaming helper: the non-stream upstream error paths (client body +
+// request/error logging) must never emit a raw upstream ErrorMessage, Body,
+// or unsafe DirectResponse flag. It clears Body and forces DirectResponse=false
+// and returns nil for a nil input.
 func sanitizeOpenAIErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
-	if errMsg == nil {
-		return nil
+	if errMsg != nil && errMsg.DirectResponse && errMsg.TrustedDirectResponse {
+		return errMsg
 	}
 	return sanitizeResponsesStreamErrorMessage(errMsg)
 }

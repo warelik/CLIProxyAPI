@@ -121,6 +121,9 @@ type RequestTerminatedError struct {
 	HTTPStatus int
 	Header     http.Header
 	Body       []byte
+	// Trusted reports that the response originated from a trusted in-process
+	// interceptor rather than an untrusted upstream HTTP error.
+	Trusted bool
 }
 
 func (e *RequestTerminatedError) Error() string {

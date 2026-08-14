@@ -45,6 +45,7 @@ func (*prematureResponsesStreamExecutor) ExecuteStream(_ context.Context, _ *cor
 			HTTPStatus: http.StatusTooManyRequests,
 			Header:     http.Header{"Retry-After": []string{"17"}, "X-Plugin-Response": []string{"true"}},
 			Body:       []byte(`{"error":{"message":"plugin direct response"}}`),
+			Trusted:    true,
 		}
 	}
 	chunks := make(chan coreexecutor.StreamChunk, 2)
@@ -934,6 +935,99 @@ func TestResponsesHandlerAcceptsMultilineDataAcrossExecutorChunks(t *testing.T) 
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "event: response.completed") {
 		t.Fatalf("cross-chunk multiline response status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
+}
+
+func TestSanitizeOpenAIErrorMessagePreservesTrustedDirect(t *testing.T) {
+	const secret = "fixture-trusted-openai-secret"
+	trusted := &interfaces.ErrorMessage{
+		StatusCode:            http.StatusTooManyRequests,
+		Error:                 errors.New("plugin"),
+		DirectResponse:        true,
+		TrustedDirectResponse: true,
+		Body:                  []byte(`{"raw":"` + secret + `"}`),
+		Headers:               http.Header{"X-Plugin": {"yes"}},
+	}
+	if got := sanitizeOpenAIErrorMessage(trusted); got != trusted {
+		t.Fatalf("trusted direct response must be preserved verbatim, got %#v", got)
+	}
+
+	untrusted := &interfaces.ErrorMessage{
+		StatusCode:     http.StatusBadGateway,
+		Error:          errors.New(`provider failed: {"api_key":"` + secret + `"}`),
+		DirectResponse: true,
+		Body:           []byte(`{"raw":"` + secret + `"}`),
+	}
+	got := sanitizeOpenAIErrorMessage(untrusted)
+	if got == nil || got.DirectResponse || got.Body != nil {
+		t.Fatalf("untrusted direct response not strict, got %#v", got)
+	}
+	if strings.Contains(got.Error.Error(), secret) {
+		t.Fatalf("untrusted sanitized error leaked %q: %q", secret, got.Error.Error())
+	}
+}
+
+func TestSanitizeResponsesInitialErrorMessageTrustedSplit(t *testing.T) {
+	const secret = "fixture-trusted-secret"
+	trusted := &interfaces.ErrorMessage{
+		StatusCode:            http.StatusBadGateway,
+		Error:                 errors.New("plugin"),
+		DirectResponse:        true,
+		TrustedDirectResponse: true,
+		Body:                  []byte(`{"raw":"` + secret + `"}`),
+		Headers:               http.Header{"X-Plugin": {"yes"}},
+	}
+	if got := sanitizeResponsesInitialErrorMessage(trusted); got != trusted {
+		t.Fatalf("trusted direct response must be preserved verbatim, got %#v", got)
+	}
+
+	untrusted := &interfaces.ErrorMessage{
+		StatusCode:            http.StatusBadGateway,
+		Error:                 errors.New(`{"error":{"type":"server_error","code":"upstream_failed","message":"provider failed: {\"api_key\":\"` + secret + `\"}"}}`),
+		DirectResponse:        true,
+		TrustedDirectResponse: false,
+		Body:                  []byte(`{"raw":"` + secret + `"}`),
+	}
+	got := sanitizeResponsesInitialErrorMessage(untrusted)
+	if got == nil || got.DirectResponse || got.TrustedDirectResponse || got.Body != nil {
+		t.Fatalf("untrusted initial error must be strict, got %#v", got)
+	}
+	if strings.Contains(got.Error.Error(), secret) {
+		t.Fatalf("untrusted initial error leaked %q: %q", secret, got.Error.Error())
+	}
+
+	plain := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream")}
+	if got := sanitizeResponsesInitialErrorMessage(plain); got == nil || got.DirectResponse {
+		t.Fatalf("plain initial error must be sanitized, got %#v", got)
+	}
+}
+
+func TestSanitizeResponsesHandlerPreservesTrustedDirectBeforeFirstFrame(t *testing.T) {
+	t.Run("trusted", func(t *testing.T) {
+		errMsg := &interfaces.ErrorMessage{
+			StatusCode:            http.StatusTooManyRequests,
+			Error:                 errors.New("plugin direct response"),
+			DirectResponse:        true,
+			TrustedDirectResponse: true,
+			Body:                  []byte(`{"error":{"message":"plugin direct response"}}`),
+			Headers:               http.Header{"Retry-After": {"17"}, "X-Plugin-Response": {"true"}},
+		}
+		got := sanitizeResponsesInitialErrorMessage(errMsg)
+		if got == nil || !got.DirectResponse || !got.TrustedDirectResponse {
+			t.Fatalf("trusted direct response not preserved: %#v", got)
+		}
+	})
+	t.Run("untrusted", func(t *testing.T) {
+		errMsg := &interfaces.ErrorMessage{
+			StatusCode:     http.StatusBadGateway,
+			Error:          errors.New("upstream failed"),
+			DirectResponse: true,
+			Body:           []byte(`{"raw":"secret"}`),
+		}
+		got := sanitizeResponsesInitialErrorMessage(errMsg)
+		if got == nil || got.DirectResponse || got.Body != nil {
+			t.Fatalf("untrusted direct response not strict: %#v", got)
+		}
+	})
 }
 
 func TestResponsesHandlerPreservesDirectResponseBeforeFirstFrame(t *testing.T) {

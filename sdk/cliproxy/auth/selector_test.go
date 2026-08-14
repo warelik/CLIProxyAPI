@@ -1636,6 +1636,123 @@ func TestSessionCacheCompareAndDeleteAliasesPreservesNewerBinding(t *testing.T) 
 	}
 }
 
+func TestSessionCacheGenerationToken_ABARejected(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	cache.SetAliases("auth-a", "pck:shared-prompt", "conv:sess-1")
+	gen1, auth1, aliases1, ok1 := cache.Observe("pck:shared-prompt")
+	if !ok1 || auth1 != "auth-a" || gen1 == 0 {
+		t.Fatalf("initial observe failed: gen=%d auth=%q aliases=%v ok=%v", gen1, auth1, aliases1, ok1)
+	}
+
+	// Mutate A -> B -> A
+	cache.SetAliases("auth-b", "pck:shared-prompt", "conv:sess-1")
+	cache.SetAliases("auth-a", "pck:shared-prompt", "conv:sess-1")
+
+	gen3, _, _, _ := cache.Observe("pck:shared-prompt")
+	if gen3 == gen1 {
+		t.Fatalf("expected generation to increment after mutations: gen1=%d gen3=%d", gen1, gen3)
+	}
+
+	// Stale CAS referencing gen1 must fail
+	replaced := cache.CompareAndReplaceGroup(gen1, "auth-a", aliases1, "auth-c", "pck:shared-prompt", "conv:sess-1")
+	if replaced {
+		t.Fatalf("CAS with stale generation must fail on ABA cycle")
+	}
+
+	for _, key := range []string{"pck:shared-prompt", "conv:sess-1"} {
+		if got, ok := cache.Get(key); !ok || got != "auth-a" {
+			t.Fatalf("cache.Get(%q) = %q, %v; want auth-a, true", key, got, ok)
+		}
+	}
+}
+
+func TestSessionCacheGenerationToken_PartialSplitAbort(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	// Group 1: primary prompt cache key bound to auth-a
+	cache.Set("pck:prompt-1", "auth-a")
+	genA, authA, aliasesA, okA := cache.Observe("pck:prompt-1")
+	if !okA || authA != "auth-a" {
+		t.Fatalf("observe prompt-1 failed: %v", okA)
+	}
+
+	// Group 2: conversation fallback key bound to auth-b
+	cache.Set("conv:sess-1", "auth-b")
+
+	// Attempting CAS to rebind prompt-1 and attach conv:sess-1 when conv:sess-1 belongs to auth-b
+	replaced := cache.CompareAndReplaceGroup(genA, "auth-a", aliasesA, "auth-c", "pck:prompt-1", "conv:sess-1")
+	if replaced {
+		t.Fatalf("CAS must fail when a new alias belongs to another active live group")
+	}
+
+	if got, ok := cache.Get("pck:prompt-1"); !ok || got != "auth-a" {
+		t.Fatalf("prompt-1 must remain auth-a, got %q, %v", got, ok)
+	}
+	if got, ok := cache.Get("conv:sess-1"); !ok || got != "auth-b" {
+		t.Fatalf("conv:sess-1 must remain auth-b, got %q, %v", got, ok)
+	}
+}
+
+func TestSessionCacheGenerationToken_SharedPromptAndTTLPreservedOnReplace(t *testing.T) {
+	cache := NewSessionCache(time.Minute)
+	defer cache.Stop()
+
+	cache.SetAliases("auth-a", "pck:shared-prompt", "conv:sess-1")
+	gen, authID, aliases, ok := cache.Observe("pck:shared-prompt")
+	if !ok {
+		t.Fatalf("observe failed")
+	}
+
+	replaced := cache.CompareAndReplaceGroup(gen, authID, aliases, "auth-b", "pck:shared-prompt", "conv:sess-1", "conv:sess-2")
+	if !replaced {
+		t.Fatalf("CompareAndReplaceGroup failed")
+	}
+
+	for _, key := range []string{"pck:shared-prompt", "conv:sess-1", "conv:sess-2"} {
+		if got, ok := cache.Get(key); !ok || got != "auth-b" {
+			t.Fatalf("cache.Get(%q) = %q, %v; want auth-b, true", key, got, ok)
+		}
+	}
+}
+
+func TestSessionAffinitySelector_FallbackFailureKeepsOldGroupIntact(t *testing.T) {
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	authA := &Auth{ID: "auth-a", Status: StatusActive}
+	provider := "test-prov"
+	model := "gpt-4o"
+	req := []byte(`{"conversation":{"id":"sess-keep-intact"},"prompt_cache_key":"prompt-keep-intact"}`)
+
+	// Bind initially to auth-a
+	picked, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: req}, []*Auth{authA})
+	if err != nil || picked.ID != "auth-a" {
+		t.Fatalf("initial pick = %v, err = %v; want auth-a", picked, err)
+	}
+
+	// Now auth-a becomes unavailable (empty candidate slice), fallback fails
+	picked2, err2 := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: req}, []*Auth{})
+	if err2 == nil {
+		t.Fatalf("expected error when no auths available, got %v", picked2)
+	}
+
+	// Verify that cache still holds auth-a and was NOT eagerly deleted
+	cacheKey := provider + "::pck:prompt-keep-intact::" + model
+	convKey := provider + "::conv:sess-keep-intact::" + model
+	if got, ok := selector.cache.Get(cacheKey); !ok || got != "auth-a" {
+		t.Fatalf("cacheKey %q = %q, %v; want auth-a intact", cacheKey, got, ok)
+	}
+	if got, ok := selector.cache.Get(convKey); !ok || got != "auth-a" {
+		t.Fatalf("convKey %q = %q, %v; want auth-a intact", convKey, got, ok)
+	}
+}
+
 func TestSessionAffinitySelectorPrimaryTrafficKeepsConversationAliasAlive(t *testing.T) {
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},

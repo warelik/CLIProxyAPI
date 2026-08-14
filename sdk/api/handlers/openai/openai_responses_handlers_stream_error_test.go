@@ -966,6 +966,24 @@ func TestSanitizeOpenAIErrorMessagePreservesTrustedDirect(t *testing.T) {
 	}
 }
 
+func TestSanitizeResponsesErrorMessageUnwrapNil(t *testing.T) {
+	rawErr := errors.New("upstream-sensitive-internal-cause")
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadGateway,
+		Error:      rawErr,
+	}
+	sanitized := sanitizeOpenAIErrorMessage(errMsg)
+	if sanitized == nil || sanitized.Error == nil {
+		t.Fatalf("expected sanitized error, got %#v", sanitized)
+	}
+	if errors.Unwrap(sanitized.Error) != nil {
+		t.Fatalf("sanitized error must return nil on errors.Unwrap, got %v", errors.Unwrap(sanitized.Error))
+	}
+	if sanitized.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d", sanitized.StatusCode, http.StatusBadGateway)
+	}
+}
+
 func TestSanitizeResponsesInitialErrorMessageTrustedSplit(t *testing.T) {
 	const secret = "fixture-trusted-secret"
 	trusted := &interfaces.ErrorMessage{
@@ -976,7 +994,7 @@ func TestSanitizeResponsesInitialErrorMessageTrustedSplit(t *testing.T) {
 		Body:                  []byte(`{"raw":"` + secret + `"}`),
 		Headers:               http.Header{"X-Plugin": {"yes"}},
 	}
-	if got := sanitizeResponsesInitialErrorMessage(trusted); got != trusted {
+	if got := sanitizeOpenAIErrorMessage(trusted); got != trusted {
 		t.Fatalf("trusted direct response must be preserved verbatim, got %#v", got)
 	}
 
@@ -987,7 +1005,7 @@ func TestSanitizeResponsesInitialErrorMessageTrustedSplit(t *testing.T) {
 		TrustedDirectResponse: false,
 		Body:                  []byte(`{"raw":"` + secret + `"}`),
 	}
-	got := sanitizeResponsesInitialErrorMessage(untrusted)
+	got := sanitizeOpenAIErrorMessage(untrusted)
 	if got == nil || got.DirectResponse || got.TrustedDirectResponse || got.Body != nil {
 		t.Fatalf("untrusted initial error must be strict, got %#v", got)
 	}
@@ -996,7 +1014,7 @@ func TestSanitizeResponsesInitialErrorMessageTrustedSplit(t *testing.T) {
 	}
 
 	plain := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream")}
-	if got := sanitizeResponsesInitialErrorMessage(plain); got == nil || got.DirectResponse {
+	if got := sanitizeOpenAIErrorMessage(plain); got == nil || got.DirectResponse {
 		t.Fatalf("plain initial error must be sanitized, got %#v", got)
 	}
 }
@@ -1011,7 +1029,7 @@ func TestSanitizeResponsesHandlerPreservesTrustedDirectBeforeFirstFrame(t *testi
 			Body:                  []byte(`{"error":{"message":"plugin direct response"}}`),
 			Headers:               http.Header{"Retry-After": {"17"}, "X-Plugin-Response": {"true"}},
 		}
-		got := sanitizeResponsesInitialErrorMessage(errMsg)
+		got := sanitizeOpenAIErrorMessage(errMsg)
 		if got == nil || !got.DirectResponse || !got.TrustedDirectResponse {
 			t.Fatalf("trusted direct response not preserved: %#v", got)
 		}
@@ -1023,7 +1041,7 @@ func TestSanitizeResponsesHandlerPreservesTrustedDirectBeforeFirstFrame(t *testi
 			DirectResponse: true,
 			Body:           []byte(`{"raw":"secret"}`),
 		}
-		got := sanitizeResponsesInitialErrorMessage(errMsg)
+		got := sanitizeOpenAIErrorMessage(errMsg)
 		if got == nil || got.DirectResponse || got.Body != nil {
 			t.Fatalf("untrusted direct response not strict: %#v", got)
 		}

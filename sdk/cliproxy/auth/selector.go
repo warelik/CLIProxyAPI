@@ -707,10 +707,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		s.cache.Set(cacheKey, authID)
 	}
-	rebindAliases := make([]string, 0, 2)
-	addRebind := func(aliases ...string) {
-		rebindAliases = mergeSessionAliases(rebindAliases, aliases...)
-	}
 	pickCached := func() *Auth {
 		if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 			for _, auth := range available {
@@ -719,11 +715,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					return auth
 				}
 			}
-			// The cached auth is no longer selectable. Atomically collect the
-			// whole alias group (pck primary + conv fallback and any shared
-			// prompt aliases) so a stale single-key delete cannot strand sibling
-			// aliases, then rebind every one to the replacement auth below.
-			addRebind(s.cache.CompareAndDeleteAliases(cacheKey, cachedAuthID)...)
 		}
 		if fallbackKey != "" {
 			if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
@@ -733,7 +724,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 						return auth
 					}
 				}
-				addRebind(s.cache.CompareAndDeleteAliases(fallbackKey, cachedAuthID)...)
 			}
 		}
 		return nil
@@ -750,14 +740,51 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		entry.Infof("session-affinity: concurrent cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
+
+	// Under bindMu, authoritatively observe the stale group state using non-refreshing token read.
+	genPrimary, authPrimary, aliasesPrimary, okPrimary := s.cache.Observe(cacheKey)
+	var genFallback uint64
+	var authFallback string
+	var aliasesFallback []string
+	var okFallback bool
+	if fallbackKey != "" {
+		genFallback, authFallback, aliasesFallback, okFallback = s.cache.Observe(fallbackKey)
+	}
+
+	splitConflict := false
+	if okPrimary && okFallback {
+		if genPrimary != genFallback || authPrimary != authFallback || !equalSessionAliases(aliasesPrimary, aliasesFallback) {
+			splitConflict = true
+		}
+	}
+
 	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
-	bind(auth.ID)
-	if len(rebindAliases) > 0 {
-		s.cache.SetAliases(auth.ID, rebindAliases...)
+
+	if !splitConflict {
+		var expectedGen uint64
+		var expectedAuth string
+		var expectedAliases []string
+		if okPrimary {
+			expectedGen = genPrimary
+			expectedAuth = authPrimary
+			expectedAliases = aliasesPrimary
+		} else if okFallback {
+			expectedGen = genFallback
+			expectedAuth = authFallback
+			expectedAliases = aliasesFallback
+		}
+		var newKeys []string
+		if fallbackKey != "" {
+			newKeys = []string{cacheKey, fallbackKey}
+		} else {
+			newKeys = []string{cacheKey}
+		}
+		_ = s.cache.CompareAndReplaceGroup(expectedGen, expectedAuth, expectedAliases, auth.ID, newKeys...)
 	}
+
 	entry.Infof("session-affinity: cache miss, rebound candidate | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }

@@ -665,7 +665,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			framer.Flush(&initialOutput)
 			safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
 			if framer.dataFrames == 0 {
-				safeErrMsg = sanitizeResponsesInitialErrorMessage(errMsg)
+				safeErrMsg = sanitizeOpenAIErrorMessage(errMsg)
 			}
 			if safeErrMsg != nil && framer.dataFrames > 0 {
 				setSSEHeaders()
@@ -701,7 +701,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				if framer.dataFrames > 0 {
 					errMsg = sanitizeResponsesStreamErrorMessage(errMsg)
 				} else {
-					errMsg = sanitizeResponsesInitialErrorMessage(errMsg)
+					errMsg = sanitizeOpenAIErrorMessage(errMsg)
 				}
 
 				if framer.dataFrames > 0 {
@@ -1124,18 +1124,9 @@ func responsesStreamErrorText(errMsg *interfaces.ErrorMessage, status int) strin
 
 type responsesStreamSanitizedError struct {
 	message string
-	cause   error
 }
 
 func (e *responsesStreamSanitizedError) Error() string { return e.message }
-func (e *responsesStreamSanitizedError) Unwrap() error { return e.cause }
-
-func sanitizeResponsesInitialErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
-	if errMsg != nil && errMsg.DirectResponse && errMsg.TrustedDirectResponse {
-		return errMsg
-	}
-	return sanitizeResponsesStreamErrorMessage(errMsg)
-}
 
 func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage {
 	if errMsg == nil {
@@ -1147,7 +1138,7 @@ func sanitizeResponsesStreamErrorMessage(errMsg *interfaces.ErrorMessage) *inter
 	}
 	safe := *errMsg
 	safe.StatusCode = status
-	safe.Error = &responsesStreamSanitizedError{message: responsesStreamErrorText(errMsg, status), cause: errMsg.Error}
+	safe.Error = &responsesStreamSanitizedError{message: responsesStreamErrorText(errMsg, status)}
 	safe.DirectResponse = false
 	safe.Body = nil
 	return &safe

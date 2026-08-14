@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,7 +130,7 @@ func TestManagerExecuteStream_TTFTTimeoutFailsOverToNextAuth(t *testing.T) {
 	if len(chunks) == 0 {
 		t.Fatalf("expected chunks from authB")
 	}
-	if got := string(chunks[0].Payload); !containsString(got, "chunk-from-auth-b") {
+	if got := string(chunks[0].Payload); !strings.Contains(got, "chunk-from-auth-b") {
 		t.Fatalf("chunk payload = %q, expected bytes ONLY from authB", got)
 	}
 
@@ -293,17 +294,4 @@ func TestStreamFirstChunkTimeout_UnsupportedKeysIgnored(t *testing.T) {
 	if got := m.streamFirstChunkTimeout(onlyUnsupported); got != 0 {
 		t.Fatalf("only unsupported metadata keys = %v, want 0 (disabled)", got)
 	}
-}
-
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstr(s, substr))
-}
-
-func containsSubstr(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

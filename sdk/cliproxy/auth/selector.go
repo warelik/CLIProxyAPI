@@ -876,7 +876,7 @@ func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey stri
 		}
 	}
 	if len(retainedF) > 0 && deletedAuthF != "" {
-		s.cache.SetAliases(deletedAuthF, retainedF...)
+		s.cache.CompareAndReplaceGroup(0, "", nil, deletedAuthF, retainedF...)
 	}
 	return false
 }

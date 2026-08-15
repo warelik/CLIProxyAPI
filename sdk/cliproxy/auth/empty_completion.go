@@ -179,6 +179,57 @@ func nonEmptyFunctionCall(raw json.RawMessage) bool {
 	return strings.TrimSpace(fc.Name) != "" || strings.TrimSpace(fc.Arguments) != ""
 }
 
+func hasMeaningfulToolCalls(rawCalls []json.RawMessage) bool {
+	for _, raw := range rawCalls {
+		if isMeaningfulToolCall(raw) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMeaningfulToolCall(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var call struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+		Name      string          `json:"name"`
+		Arguments string          `json:"arguments"`
+		Custom    json.RawMessage `json:"custom"`
+	}
+	if err := json.Unmarshal(trimmed, &call); err != nil {
+		var m map[string]any
+		if err := json.Unmarshal(trimmed, &m); err == nil && len(m) > 0 {
+			for _, v := range m {
+				if v != nil && v != "" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if strings.TrimSpace(call.ID) != "" {
+		return true
+	}
+	if strings.TrimSpace(call.Function.Name) != "" || strings.TrimSpace(call.Function.Arguments) != "" {
+		return true
+	}
+	if strings.TrimSpace(call.Name) != "" || strings.TrimSpace(call.Arguments) != "" {
+		return true
+	}
+	if nonEmptyJSONPayload(call.Custom) {
+		return true
+	}
+	return false
+}
+
 type claudeContentBlock struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text"`
@@ -397,7 +448,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 			(ch.Message.Refusal != nil && strings.TrimSpace(*ch.Message.Refusal) != "") {
 			a.hasContent = true
 		}
-		if len(ch.Delta.ToolCalls) > 0 || len(ch.Message.ToolCalls) > 0 {
+		if hasMeaningfulToolCalls(ch.Delta.ToolCalls) || hasMeaningfulToolCalls(ch.Message.ToolCalls) {
 			a.hasToolCalls = true
 		}
 		if nonEmptyFunctionCall(ch.Delta.FunctionCall) || nonEmptyFunctionCall(ch.Message.FunctionCall) {

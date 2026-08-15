@@ -404,7 +404,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		stopTTFT()
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks)
+		var (
+			buffered     []cliproxyexecutor.StreamChunk
+			closed       bool
+			bootstrapErr error
+		)
+		if !cliproxyexecutor.DownstreamWebsocket(ctx) {
+			buffered, closed, bootstrapErr = readStreamBootstrap(attemptCtx, streamResult.Chunks)
+		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				stopTTFT()

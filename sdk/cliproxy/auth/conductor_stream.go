@@ -291,11 +291,25 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		// preparation: the budget measures upstream responsiveness, so a slow
 		// after-auth interceptor must not cancel the attempt before any
 		// upstream request was even made.
-		if ttftTimeout > 0 {
-			timer = time.AfterFunc(ttftTimeout, func() {
-				timedOut.Store(true)
-				cancelAttempt()
-			})
+		armTTFT := func() {
+			if ttftTimeout > 0 {
+				timer = time.AfterFunc(ttftTimeout, func() {
+					timedOut.Store(true)
+					cancelAttempt()
+				})
+			}
+		}
+		armTTFT()
+		// The unauthorized-refresh retries below re-execute behind a credential
+		// refresh, which may consume the whole TTFT budget (or fire the timer
+		// and cancel attemptCtx). Restart the first-chunk window on a fresh
+		// attempt context so the refreshed upstream request gets a full budget.
+		restartAttempt := func() {
+			stopTTFT()
+			cancelAttempt()
+			attemptCtx, cancelAttempt = context.WithCancel(ctx)
+			timedOut.Store(false)
+			armTTFT()
 		}
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		if errStream != nil {
@@ -322,6 +336,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					restartAttempt()
 					streamResult, errStream = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 					errStream = checkTTFTErr(errStream)
 					if errStream != nil {
@@ -392,6 +407,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
+					restartAttempt()
 					retryStream, retryErr := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
 					retryErr = checkTTFTErr(retryErr)
@@ -460,11 +476,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
-		if closed && (len(buffered) == 0 || isEmptyCompletion(buffered)) {
+		payloadBytes := 0
+		for _, chunk := range buffered {
+			payloadBytes += len(chunk.Payload)
+		}
+		// Determine emptiness by buffered payload bytes, not chunk count:
+		// zero-payload chunks are dropped downstream by wrapStreamResult, so a
+		// stream of only such chunks would surface as a successful empty
+		// completion without failover.
+		if closed && (payloadBytes == 0 || isEmptyCompletion(buffered)) {
 			stopTTFT()
 			cancelAttempt()
 			emptyErr := errEmptyCompletion
-			if len(buffered) == 0 {
+			if payloadBytes == 0 {
 				emptyErr = &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}

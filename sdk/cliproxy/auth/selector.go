@@ -842,11 +842,11 @@ func (s *SessionAffinitySelector) rebindGroupCAS(sessionKey string, expectedGen 
 func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey string, authID string) bool {
 	for attempt := 0; attempt < 3; attempt++ {
 		genP, authP, aliasesP, okP := s.cache.Observe(cacheKey)
-		_, authF, aliasesF, okF := s.cache.Observe(fallbackKey)
+		genF, authF, aliasesF, okF := s.cache.Observe(fallbackKey)
 		merged := mergeSessionAliases(aliasesP, aliasesF...)
 		merged = mergeSessionAliases(merged, cacheKey, fallbackKey)
 		if okF && authF != authID {
-			if removed := s.cache.CompareAndDeleteAliases(fallbackKey, authF); removed == nil {
+			if removed := s.cache.CompareAndDeleteGroup(fallbackKey, authF, genF, aliasesF); removed == nil {
 				continue
 			}
 		}

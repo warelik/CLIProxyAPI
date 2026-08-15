@@ -192,3 +192,44 @@ func TestPickRebindsSplitAffinityGroupsOnFailover(t *testing.T) {
 		t.Fatalf("primary group aliases %v missing fallback key %q", aliasesPrimary, fallbackKey)
 	}
 }
+
+// TestCompareAndDeleteGroupRejectsStaleObservation covers the codex P2
+// follow-up on PR #4881: when a concurrent request refreshes or extends the
+// fallback group between Observe and the delete, a stale merge observation
+// must not remove the newer group, otherwise the newly attached aliases lose
+// their affinity binding.
+func TestCompareAndDeleteGroupRejectsStaleObservation(t *testing.T) {
+	t.Parallel()
+
+	cache := NewSessionCache(time.Minute)
+	key := "gemini::conv:c1::test-model"
+	extended := "gemini::conv:c2::test-model"
+	cache.SetAliases("auth-a", key)
+
+	gen, authID, aliases, ok := cache.Observe(key)
+	if !ok || authID != "auth-a" {
+		t.Fatalf("Observe() = %q, ok=%v; want auth-a bound", authID, ok)
+	}
+
+	// A concurrent request extends the same group on the same auth.
+	cache.SetAliases("auth-a", key, extended)
+
+	if removed := cache.CompareAndDeleteGroup(key, "auth-a", gen, aliases); removed != nil {
+		t.Fatalf("CompareAndDeleteGroup with stale observation removed %v; want nil (group must survive)", removed)
+	}
+	if _, got, gotAliases, ok := cache.Observe(key); !ok || got != "auth-a" || !slices.Contains(gotAliases, extended) {
+		t.Fatalf("group after stale delete = %q, aliases=%v, ok=%v; want intact auth-a group", got, gotAliases, ok)
+	}
+
+	// A fresh observation still deletes successfully.
+	gen, authID, aliases, ok = cache.Observe(key)
+	if !ok {
+		t.Fatal("Observe() after extension lost the group")
+	}
+	if removed := cache.CompareAndDeleteGroup(key, authID, gen, aliases); removed == nil {
+		t.Fatal("CompareAndDeleteGroup with fresh observation returned nil; want removed aliases")
+	}
+	if _, _, _, ok := cache.Observe(key); ok {
+		t.Fatal("group still present after fresh CompareAndDeleteGroup")
+	}
+}

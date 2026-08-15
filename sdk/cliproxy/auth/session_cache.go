@@ -419,6 +419,30 @@ func (c *SessionCache) CompareAndDeleteAliases(sessionID, expectedAuthID string)
 	return aliases
 }
 
+// CompareAndDeleteGroup removes a binding only when its auth ID, generation,
+// and alias set all still match the observed values, and returns the removed
+// aliases. A concurrent refresh or extension of the group bumps the
+// generation or changes the aliases, so a stale observation cannot delete
+// newer state; callers retry their merge on a nil result.
+func (c *SessionCache) CompareAndDeleteGroup(sessionID, expectedAuthID string, expectedGen uint64, expectedAliases []string) []string {
+	if c == nil || sessionID == "" || expectedAuthID == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[sessionID]
+	if !ok || entry.authID != expectedAuthID || entry.generation != expectedGen {
+		return nil
+	}
+	if !equalSessionAliases(compactSessionAliases(entry.aliases), compactSessionAliases(expectedAliases)) {
+		return nil
+	}
+	removed := append([]string(nil), entry.aliases...)
+	c.removeAliasGroupLocked(entry)
+	return removed
+}
+
 // InvalidateAuth removes all sessions bound to a specific auth ID.
 // Used when an auth becomes unavailable.
 func (c *SessionCache) InvalidateAuth(authID string) {

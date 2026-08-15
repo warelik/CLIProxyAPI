@@ -915,15 +915,6 @@ func (s *streamBootstrapState) processLine(line []byte) {
 		s.flushData()
 		return
 	}
-	if isSSEMetadataLine(line) {
-		if idx := bytes.Index(line, []byte("data:")); idx > 0 {
-			metaPart := bytes.TrimSpace(line[:idx])
-			dataPart := bytes.TrimSpace(line[idx:])
-			s.processSingleLine(metaPart)
-			s.processSingleLine(dataPart)
-			return
-		}
-	}
 	s.processSingleLine(line)
 }
 
@@ -1242,15 +1233,6 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
 		if len(line) == 0 {
 			flush()
 			return
-		}
-		if isSSEMetadataLine(line) {
-			if idx := bytes.Index(line, []byte("data:")); idx > 0 {
-				metaPart := bytes.TrimSpace(line[:idx])
-				dataPart := bytes.TrimSpace(line[idx:])
-				processSingle(metaPart)
-				processSingle(dataPart)
-				return
-			}
 		}
 		processSingle(line)
 	}

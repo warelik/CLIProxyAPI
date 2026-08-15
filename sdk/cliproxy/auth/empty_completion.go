@@ -312,6 +312,8 @@ type emptyCompletionAccum struct {
 	completionTokens int
 	sawUsage         bool
 	blocked          bool
+	sawMetadataOnly  bool
+	sawMessageData   bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -359,6 +361,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		return false
 	}
 	a.recognized = true
+	a.sawMessageData = true
 	var chunk openAIChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		// A recognized choices-bearing payload whose shape does not decode
@@ -437,6 +440,11 @@ func (a *emptyCompletionAccum) evalClaude(data []byte) bool {
 	}
 
 	a.recognized = true
+	if chunk.Type == "ping" {
+		a.sawMetadataOnly = true
+	} else {
+		a.sawMessageData = true
+	}
 
 	a.evalClaudeStopReason(chunk.StopReason)
 	if chunk.Message != nil {
@@ -517,6 +525,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		return false
 	}
 	a.recognized = true
+	a.sawMessageData = true
 
 	var chunk openAIResponseChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
@@ -695,6 +704,7 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 		// Gemini shape at all.
 		if hasJSONKey(data, "candidates") || hasNestedResponseCandidates(data) {
 			a.recognized = true
+			a.sawMessageData = true
 			a.terminal = true
 			a.blocked = promptBlocked
 			if usage != nil && usage.CandidatesTokenCount != nil {
@@ -707,6 +717,7 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 	}
 
 	a.recognized = true
+	a.sawMessageData = true
 	if promptBlocked {
 		a.blocked = true
 	}
@@ -768,19 +779,16 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 
 // empty reports whether the accumulated stream is an empty completion.
 func (a *emptyCompletionAccum) empty() bool {
-	if !a.recognized || a.sawUnknownData || !a.terminal {
+	if a.sawUnknownData || a.blocked || a.hasContent || a.hasToolCalls || (a.sawUsage && a.completionTokens > 0) {
 		return false
 	}
-	if a.blocked {
-		return false
+	if a.recognized && a.terminal {
+		return true
 	}
-	if a.hasContent || a.hasToolCalls {
-		return false
+	if a.sawMetadataOnly && !a.sawMessageData {
+		return true
 	}
-	if a.sawUsage && a.completionTokens > 0 {
-		return false
-	}
-	return true
+	return false
 }
 
 // isEmptyCompletion reports whether the buffered SSE stream chunks aggregate to
@@ -823,6 +831,7 @@ func (s *streamBootstrapState) flushData() {
 	if bytes.Equal(data, []byte("[DONE]")) {
 		s.acc.recognized = true
 		s.acc.terminal = true
+		s.acc.sawMessageData = true
 		return
 	}
 	if len(data) == 0 {
@@ -856,9 +865,13 @@ func (s *streamBootstrapState) observe(fragment []byte) bool {
 					event := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:")))
 					if bytes.Equal(event, []byte("message_stop")) {
 						s.acc.recognized = true
+						s.acc.sawMessageData = true
+					} else {
+						s.acc.sawMetadataOnly = true
 					}
 				case bytes.HasPrefix(line, []byte("id:")), bytes.HasPrefix(line, []byte("retry:")), bytes.HasPrefix(line, []byte(":")):
 					s.sawSSE = true
+					s.acc.sawMetadataOnly = true
 				case bytes.HasPrefix(line, []byte("data:")):
 					s.sawSSE = true
 					s.dataLines = append(s.dataLines, parseSSEDataLine(line))
@@ -925,9 +938,13 @@ func (s *streamBootstrapState) finish() {
 				event := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("event:")))
 				if bytes.Equal(event, []byte("message_stop")) {
 					s.acc.recognized = true
+					s.acc.sawMessageData = true
+				} else {
+					s.acc.sawMetadataOnly = true
 				}
 			case bytes.HasPrefix(trimmed, []byte("id:")), bytes.HasPrefix(trimmed, []byte("retry:")), bytes.HasPrefix(trimmed, []byte(":")):
 				s.sawSSE = true
+				s.acc.sawMetadataOnly = true
 			case bytes.HasPrefix(trimmed, []byte("data:")):
 				s.sawSSE = true
 				s.dataLines = append(s.dataLines, parseSSEDataLine(trimmed))
@@ -1105,6 +1122,7 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
 		if bytes.Equal(data, []byte("[DONE]")) {
 			a.recognized = true
 			a.terminal = true
+			a.sawMessageData = true
 			return
 		}
 		if len(data) == 0 {
@@ -1125,10 +1143,14 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
 			event := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:")))
 			if bytes.Equal(event, []byte("message_stop")) {
 				a.recognized = true
+				a.sawMessageData = true
+			} else {
+				a.sawMetadataOnly = true
 			}
 			continue
 		}
 		if bytes.HasPrefix(line, []byte("id:")) || bytes.HasPrefix(line, []byte("retry:")) || bytes.HasPrefix(line, []byte(":")) {
+			a.sawMetadataOnly = true
 			continue
 		}
 		switch {

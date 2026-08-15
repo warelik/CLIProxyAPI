@@ -783,6 +783,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							suspendReason = "invalid_grant"
 							shouldSuspendModel = true
 						}
+					} else if isInvalidAPIKeyResultError(result.Error) {
+						if disableCooling {
+							state.NextRetryAfter = time.Time{}
+						} else {
+							state.NextRetryAfter = now.Add(30 * time.Minute)
+							suspendReason = "invalid_api_key"
+							shouldSuspendModel = true
+						}
 					} else {
 						switch statusCode {
 						case 401:
@@ -1504,6 +1512,38 @@ func isInvalidGrantResultError(err *Error) bool {
 	return isInvalidGrantErrorMessage(err.Code) || isInvalidGrantErrorMessage(err.Message)
 }
 
+// isInvalidAPIKeyErrorMessage matches upstream "invalid API key" rejections
+// that arrive as generic client errors instead of 401/403 — Google answers a
+// dead Gemini key with 400 INVALID_ARGUMENT and
+// "API key not valid. Please pass a valid API key.", so a request-fault
+// classification would wrongly stop credential rotation on a dead key.
+func isInvalidAPIKeyErrorMessage(message string) bool {
+	lowered := strings.ToLower(message)
+	return strings.Contains(lowered, "api key not valid") || strings.Contains(lowered, "api_key_invalid")
+}
+
+func isInvalidAPIKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if status != http.StatusBadRequest && status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	return isInvalidAPIKeyErrorMessage(err.Error())
+}
+
+func isInvalidAPIKeyResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest && status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	return isInvalidAPIKeyErrorMessage(err.Code) || isInvalidAPIKeyErrorMessage(err.Message)
+}
+
 func isModelSupportResultError(err *Error) bool {
 	if err == nil {
 		return false
@@ -1778,6 +1818,9 @@ func isRequestInvalidError(err error) bool {
 	if isInvalidGrantError(err) {
 		return false
 	}
+	if isInvalidAPIKeyError(err) {
+		return false
+	}
 	if isModelSupportError(err) {
 		return false
 	}
@@ -1833,6 +1876,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	if isInvalidGrantResultError(resultErr) {
 		auth.StatusMessage = "invalid_grant"
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
+		return
+	}
+	if isInvalidAPIKeyResultError(resultErr) {
+		auth.StatusMessage = "invalid_api_key"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {

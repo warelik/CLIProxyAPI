@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -176,12 +177,18 @@ func TestPickRebindsSplitAffinityGroupsOnFailover(t *testing.T) {
 		t.Fatalf("Pick() = %v, want auth-c (only available auth)", auth.ID)
 	}
 
-	_, gotPrimary, _, okPrimary := selector.cache.Observe(primaryKey)
+	genP, gotPrimary, aliasesPrimary, okPrimary := selector.cache.Observe(primaryKey)
 	if !okPrimary || gotPrimary != "auth-c" {
 		t.Fatalf("primary group after failover = %q (ok=%v), want auth-c", gotPrimary, okPrimary)
 	}
-	_, gotFallback, _, okFallback := selector.cache.Observe(fallbackKey)
+	genF, gotFallback, _, okFallback := selector.cache.Observe(fallbackKey)
 	if !okFallback || gotFallback != "auth-c" {
 		t.Fatalf("fallback group after failover = %q (ok=%v), want auth-c", gotFallback, okFallback)
+	}
+	if genP == 0 || genP != genF {
+		t.Fatalf("split groups not merged into one: primary gen=%d, fallback gen=%d", genP, genF)
+	}
+	if !slices.Contains(aliasesPrimary, fallbackKey) {
+		t.Fatalf("primary group aliases %v missing fallback key %q", aliasesPrimary, fallbackKey)
 	}
 }

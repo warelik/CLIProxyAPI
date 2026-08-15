@@ -840,15 +840,26 @@ func (s *SessionAffinitySelector) rebindGroupCAS(sessionKey string, expectedGen 
 // keep selecting a failed auth. The merge is retried with fresh observation
 // when a concurrent writer invalidates the expectations (bounded).
 func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey string, authID string) bool {
+	// retainedF holds the fallback group's aliases once its delete has
+	// committed. A retry after a lost primary CAS would otherwise re-observe
+	// the (now deleted) fallback entry and rebuild merged from cacheKey and
+	// fallbackKey alone, permanently dropping the fallback group's
+	// historical aliases from the rebound group.
+	var retainedF []string
 	for attempt := 0; attempt < 3; attempt++ {
 		genP, authP, aliasesP, okP := s.cache.Observe(cacheKey)
 		genF, authF, aliasesF, okF := s.cache.Observe(fallbackKey)
+		if !okF {
+			aliasesF = retainedF
+		}
 		merged := mergeSessionAliases(aliasesP, aliasesF...)
 		merged = mergeSessionAliases(merged, cacheKey, fallbackKey)
 		if okF && authF != authID {
-			if removed := s.cache.CompareAndDeleteGroup(fallbackKey, authF, genF, aliasesF); removed == nil {
+			removed := s.cache.CompareAndDeleteGroup(fallbackKey, authF, genF, aliasesF)
+			if removed == nil {
 				continue
 			}
+			retainedF = mergeSessionAliases(retainedF, removed...)
 		}
 		if okP {
 			if s.cache.CompareAndReplaceGroup(genP, authP, aliasesP, authID, merged...) {

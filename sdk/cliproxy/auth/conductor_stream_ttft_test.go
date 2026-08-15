@@ -397,3 +397,74 @@ func TestStreamTTFTCallbackDoesNotMarkSubsequentNonTimeoutErrorAs504(t *testing.
 		}
 	}
 }
+
+type slowFirstChunkStreamExecutor struct {
+	calls atomic.Int32
+}
+
+func (e *slowFirstChunkStreamExecutor) Identifier() string { return "gemini" }
+
+func (e *slowFirstChunkStreamExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *slowFirstChunkStreamExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.calls.Add(1)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n")}
+		close(chunks)
+	}()
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *slowFirstChunkStreamExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *slowFirstChunkStreamExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) {
+	return a, nil
+}
+
+func (e *slowFirstChunkStreamExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func TestStreamTTFTDeadlineStoppedOnceUpstreamConnects(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-ttft-connected", Provider: "gemini", Status: StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	manager.RefreshSchedulerEntry(auth.ID)
+	exec := &slowFirstChunkStreamExecutor{}
+	manager.RegisterExecutor(exec)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{"stream_first_chunk_timeout_ms": 30},
+	}
+	result, err := manager.ExecuteStream(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "test-model"}, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v, want established stream to not time out during chunk wait", err)
+	}
+	if result == nil || result.Chunks == nil {
+		t.Fatal("ExecuteStream() returned nil result or nil chunks")
+	}
+	var payloadBytes int
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		payloadBytes += len(chunk.Payload)
+	}
+	if payloadBytes == 0 {
+		t.Fatal("expected non-empty stream payload")
+	}
+	if got := exec.calls.Load(); got != 1 {
+		t.Fatalf("expected 1 ExecuteStream call, got %d", got)
+	}
+}

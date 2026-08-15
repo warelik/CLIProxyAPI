@@ -392,6 +392,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			continue
 		}
+		stopTTFT()
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks)
 		if bootstrapErr != nil {
@@ -425,6 +426,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					restartAttempt()
 					retryStream, retryErr := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)
+					stopTTFT()
 					retryErr = checkTTFTErr(retryErr)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {

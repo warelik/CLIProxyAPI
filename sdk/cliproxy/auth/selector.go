@@ -848,6 +848,7 @@ func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey stri
 	// fallbackKey alone, permanently dropping the fallback group's
 	// historical aliases from the rebound group.
 	var retainedF []string
+	var deletedAuthF string
 	for attempt := 0; attempt < 3; attempt++ {
 		genP, authP, aliasesP, okP := s.cache.Observe(cacheKey)
 		genF, authF, aliasesF, okF := s.cache.Observe(fallbackKey)
@@ -861,6 +862,7 @@ func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey stri
 			if removed == nil {
 				continue
 			}
+			deletedAuthF = authF
 			retainedF = mergeSessionAliases(retainedF, removed...)
 		}
 		if okP {
@@ -872,6 +874,9 @@ func (s *SessionAffinitySelector) mergeSplitGroupsCAS(cacheKey, fallbackKey stri
 		if s.cache.CompareAndReplaceGroup(0, "", nil, authID, merged...) {
 			return true
 		}
+	}
+	if len(retainedF) > 0 && deletedAuthF != "" {
+		s.cache.SetAliases(deletedAuthF, retainedF...)
 	}
 	return false
 }

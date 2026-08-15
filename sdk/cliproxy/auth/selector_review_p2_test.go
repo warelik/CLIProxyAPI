@@ -1,10 +1,13 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // Regression tests for codex pullrequestreview-4943660625 on PR #4881
@@ -117,5 +120,68 @@ func TestRebindGroupCASRetriesAfterConcurrentWrite(t *testing.T) {
 	_, finalAuth, _, ok := selector.cache.Observe(cacheKey)
 	if !ok || finalAuth != "auth-new" {
 		t.Fatalf("Observe() authID = %q, ok = %v; want auth-new bound", finalAuth, ok)
+	}
+}
+
+// TestPickRebindsSplitAffinityGroupsOnFailover is a regression guard for the
+// codex P2 finding on PR #4881: when the prompt-cache and conversation
+// aliases were previously bound to different auths (split groups) and both
+// cached credentials are unavailable, pickCached missed and the splitConflict
+// branch skipped the rebind, leaving the session pinned to the dead split
+// bindings. The fallback auth must now be reconciled onto both groups.
+func TestPickRebindsSplitAffinityGroupsOnFailover(t *testing.T) {
+	t.Parallel()
+
+	model := "test-model"
+	provider := "gemini"
+	primaryKey := provider + "::pck:pk1::" + model
+	fallbackKey := provider + "::conv:c1::" + model
+
+	cooled := func(id string) *Auth {
+		return &Auth{
+			ID: id,
+			ModelStates: map[string]*ModelState{
+				model: {
+					Status:         StatusActive,
+					Unavailable:    true,
+					NextRetryAfter: time.Now().Add(60 * time.Second),
+					Quota: QuotaState{
+						Exceeded:      true,
+						NextRecoverAt: time.Now().Add(60 * time.Second),
+					},
+				},
+			},
+		}
+	}
+	authA := cooled("auth-a")
+	authB := cooled("auth-b")
+	authC := &Auth{
+		ID: "auth-c",
+		ModelStates: map[string]*ModelState{
+			model: {Status: StatusActive},
+		},
+	}
+
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	selector.cache.SetAliases("auth-a", primaryKey)
+	selector.cache.SetAliases("auth-b", fallbackKey)
+
+	payload := []byte(`{"prompt_cache_key":"pk1","conversation":{"id":"c1"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload, Metadata: map[string]any{}}
+	auth, err := selector.Pick(context.Background(), provider, model, opts, []*Auth{authA, authB, authC})
+	if err != nil {
+		t.Fatalf("Pick() error = %v, want nil", err)
+	}
+	if auth != authC {
+		t.Fatalf("Pick() = %v, want auth-c (only available auth)", auth.ID)
+	}
+
+	_, gotPrimary, _, okPrimary := selector.cache.Observe(primaryKey)
+	if !okPrimary || gotPrimary != "auth-c" {
+		t.Fatalf("primary group after failover = %q (ok=%v), want auth-c", gotPrimary, okPrimary)
+	}
+	_, gotFallback, _, okFallback := selector.cache.Observe(fallbackKey)
+	if !okFallback || gotFallback != "auth-c" {
+		t.Fatalf("fallback group after failover = %q (ok=%v), want auth-c", gotFallback, okFallback)
 	}
 }

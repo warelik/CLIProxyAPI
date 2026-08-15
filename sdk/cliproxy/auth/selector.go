@@ -774,7 +774,24 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	if !splitConflict {
+	if splitConflict {
+		// The prompt-cache and conversation aliases were previously bound to
+		// different auths and both cached credentials are unavailable, so
+		// pickCached missed. Reconcile each observed group onto the selected
+		// fallback auth: bypassing the rebind would leave the session pinned
+		// to the dead split bindings (a later OnResult only Touches and cannot
+		// replace either group), breaking session affinity during failover.
+		if okPrimary {
+			if !s.rebindGroupCAS(cacheKey, genPrimary, authPrimary, aliasesPrimary, auth.ID, aliasesPrimary) {
+				entry.Infof("session-affinity: split-group rebind (primary) lost to concurrent writer after retries | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			}
+		}
+		if okFallback {
+			if !s.rebindGroupCAS(fallbackKey, genFallback, authFallback, aliasesFallback, auth.ID, aliasesFallback) {
+				entry.Infof("session-affinity: split-group rebind (fallback) lost to concurrent writer after retries | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			}
+		}
+	} else {
 		var expectedGen uint64
 		var expectedAuth string
 		var expectedAliases []string

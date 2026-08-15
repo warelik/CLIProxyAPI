@@ -247,3 +247,153 @@ func TestStreamZeroPayloadChunksAreEmptyCompletion(t *testing.T) {
 		t.Fatalf("expected one ExecuteStream call, got %d", got)
 	}
 }
+
+// ttftRaceProbeExecutor is designed to trigger the race where timer 1 fires
+// right around restartAttempt during unauthorized refresh.
+type ttftRaceProbeExecutor struct {
+	calls        atomic.Int32
+	refreshCalls atomic.Int32
+	retryCtxErr  atomic.Value // error
+}
+
+func (e *ttftRaceProbeExecutor) Identifier() string { return "gemini" }
+
+func (e *ttftRaceProbeExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *ttftRaceProbeExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	call := e.calls.Add(1)
+	if call == 1 {
+		return nil, errors.New("upstream returned status 401")
+	}
+	if err := ctx.Err(); err != nil {
+		e.retryCtxErr.Store(err)
+		return nil, err
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: success\n\n")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *ttftRaceProbeExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *ttftRaceProbeExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) {
+	e.refreshCalls.Add(1)
+	time.Sleep(5 * time.Millisecond)
+	return a, nil
+}
+
+func (e *ttftRaceProbeExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+// TestStreamTTFTCallbackBoundToAttemptAcrossRefreshRace tests that an in-flight
+// TTFT timeout callback from the first attempt does not cancel the refreshed
+// attempt or mark it as timed out.
+func TestStreamTTFTCallbackBoundToAttemptAcrossRefreshRace(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		manager := NewManager(nil, nil, nil)
+		auth := &Auth{
+			ID:       "auth-oauth-race",
+			Provider: "gemini",
+			Status:   StatusActive,
+			Metadata: map[string]any{"auth_kind": "oauth", "refresh_token": "x"},
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+		reg := registry.GetGlobalRegistry()
+		reg.RegisterClient(auth.ID, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+		manager.RefreshSchedulerEntry(auth.ID)
+		exec := &ttftRaceProbeExecutor{}
+		manager.RegisterExecutor(exec)
+
+		opts := cliproxyexecutor.Options{
+			Metadata: map[string]any{"stream_first_chunk_timeout_ms": 5},
+		}
+		_, err := manager.ExecuteStream(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "test-model"}, opts)
+		reg.UnregisterClient(auth.ID)
+
+		if err != nil {
+			t.Fatalf("iteration %d: ExecuteStream() error = %v, retryCtxErr = %v", i, err, exec.retryCtxErr.Load())
+		}
+	}
+}
+
+// ttftNonTimeoutErrExecutor returns 401 on first call, refreshes, and then
+// returns a 500 error on the second call.
+type ttftNonTimeoutErrExecutor struct {
+	calls        atomic.Int32
+	refreshCalls atomic.Int32
+}
+
+func (e *ttftNonTimeoutErrExecutor) Identifier() string { return "gemini" }
+
+func (e *ttftNonTimeoutErrExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *ttftNonTimeoutErrExecutor) ExecuteStream(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	call := e.calls.Add(1)
+	if call == 1 {
+		return nil, errors.New("upstream returned status 401")
+	}
+	return nil, &Error{Code: "internal_error", Message: "upstream 500 internal server error", HTTPStatus: 500}
+}
+
+func (e *ttftNonTimeoutErrExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *ttftNonTimeoutErrExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) {
+	e.refreshCalls.Add(1)
+	time.Sleep(5 * time.Millisecond)
+	return a, nil
+}
+
+func (e *ttftNonTimeoutErrExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+// TestStreamTTFTCallbackDoesNotMarkSubsequentNonTimeoutErrorAs504 tests that a
+// stale callback from attempt 1 does not reset timedOut to true and turn a
+// non-timeout error on attempt 2 into a 504 stream_first_chunk_timeout.
+func TestStreamTTFTCallbackDoesNotMarkSubsequentNonTimeoutErrorAs504(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		manager := NewManager(nil, nil, nil)
+		auth := &Auth{
+			ID:       "auth-oauth-500",
+			Provider: "gemini",
+			Status:   StatusActive,
+			Metadata: map[string]any{"auth_kind": "oauth", "refresh_token": "x"},
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+		reg := registry.GetGlobalRegistry()
+		reg.RegisterClient(auth.ID, "gemini", []*registry.ModelInfo{{ID: "test-model"}})
+		manager.RefreshSchedulerEntry(auth.ID)
+		exec := &ttftNonTimeoutErrExecutor{}
+		manager.RegisterExecutor(exec)
+
+		opts := cliproxyexecutor.Options{
+			Metadata: map[string]any{"stream_first_chunk_timeout_ms": 5},
+		}
+		_, err := manager.ExecuteStream(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{Model: "test-model"}, opts)
+		reg.UnregisterClient(auth.ID)
+
+		if err == nil {
+			t.Fatalf("iteration %d: expected error, got nil", i)
+		}
+		if strings.Contains(err.Error(), "stream_first_chunk_timeout") || statusCodeFromError(err) == http.StatusGatewayTimeout {
+			t.Fatalf("iteration %d: stale TTFT callback marked attempt 2 as 504: %v", i, err)
+		}
+		if !strings.Contains(err.Error(), "internal_error") && !strings.Contains(err.Error(), "500") {
+			t.Fatalf("iteration %d: expected internal_error 500, got: %v", i, err)
+		}
+	}
+}

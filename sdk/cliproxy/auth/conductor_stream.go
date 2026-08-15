@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -251,11 +252,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		attemptCtx, cancelAttempt := context.WithCancel(ctx)
 		var timer *time.Timer
 		var timedOut atomic.Bool
+		var attemptMu sync.Mutex
+		var attemptSeq uint64
 
 		stopTTFT := func() {
 			if timer != nil {
 				timer.Stop()
 			}
+			attemptMu.Lock()
+			attemptSeq++
+			attemptMu.Unlock()
 		}
 
 		checkTTFTErr := func(err error) error {
@@ -293,9 +299,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		// upstream request was even made.
 		armTTFT := func() {
 			if ttftTimeout > 0 {
+				currentSeq := attemptSeq
+				currentCancel := cancelAttempt
 				timer = time.AfterFunc(ttftTimeout, func() {
+					attemptMu.Lock()
+					defer attemptMu.Unlock()
+					if currentSeq != attemptSeq {
+						return
+					}
 					timedOut.Store(true)
-					cancelAttempt()
+					currentCancel()
 				})
 			}
 		}
@@ -306,9 +319,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		// attempt context so the refreshed upstream request gets a full budget.
 		restartAttempt := func() {
 			stopTTFT()
+			attemptMu.Lock()
 			cancelAttempt()
 			attemptCtx, cancelAttempt = context.WithCancel(ctx)
 			timedOut.Store(false)
+			attemptMu.Unlock()
 			armTTFT()
 		}
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)

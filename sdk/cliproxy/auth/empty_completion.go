@@ -236,6 +236,7 @@ type claudeContentBlock struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text"`
 	Thinking string          `json:"thinking"`
+	Data     string          `json:"data"`
 	Input    json.RawMessage `json:"input"`
 }
 
@@ -700,8 +701,8 @@ func (a *emptyCompletionAccum) evalClaudeBlocks(blocks []claudeContentBlock) {
 			a.hasToolCalls = true
 			continue
 		}
-		if b.Type == "thinking" || b.Type == "redacted_thinking" || b.Type == "reasoning" || strings.TrimSpace(b.Thinking) != "" {
-			if strings.TrimSpace(b.Thinking) != "" {
+		if b.Type == "thinking" || b.Type == "redacted_thinking" || b.Type == "reasoning" || strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Data) != "" {
+			if strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Data) != "" {
 				a.hasContent = true
 			}
 			continue

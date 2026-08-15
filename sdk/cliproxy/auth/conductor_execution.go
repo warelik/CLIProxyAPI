@@ -393,12 +393,18 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				if isCredentialScopedError(errExec) {
+					result.CredentialScope = true
+				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				tracker.Record(auth, errExec)
 				authErr = errExec
+				if result.CredentialScope {
+					break
+				}
 				continue
 			}
 			if isEmptyCompletionPayload(resp.Payload) {
@@ -539,6 +545,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if isCountTokensEndpointNotFoundError(errExec, execReq.Model) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
+					if isCredentialScopedError(errExec) {
+						result.CredentialScope = true
+					}
 					m.MarkResult(execCtx, result)
 				}
 				if isRequestInvalidError(errExec) {
@@ -546,6 +555,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				tracker.Record(auth, errExec)
 				authErr = errExec
+				if result.CredentialScope {
+					break
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)

@@ -786,6 +786,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: split-group merge lost to concurrent writer after retries | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		}
 	} else {
+		groupKey := cacheKey
 		var expectedGen uint64
 		var expectedAuth string
 		var expectedAliases []string
@@ -794,6 +795,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			expectedAuth = authPrimary
 			expectedAliases = aliasesPrimary
 		} else if okFallback {
+			groupKey = fallbackKey
 			expectedGen = genFallback
 			expectedAuth = authFallback
 			expectedAliases = aliasesFallback
@@ -804,7 +806,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		} else {
 			newKeys = []string{cacheKey}
 		}
-		if !s.rebindGroupCAS(cacheKey, expectedGen, expectedAuth, expectedAliases, auth.ID, newKeys) {
+		if !s.rebindGroupCAS(groupKey, expectedGen, expectedAuth, expectedAliases, auth.ID, newKeys) {
 			entry.Infof("session-affinity: rebind lost to concurrent writer after retries | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		}
 	}

@@ -787,7 +787,35 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						if disableCooling {
 							state.NextRetryAfter = time.Time{}
 						} else {
-							state.NextRetryAfter = now.Add(30 * time.Minute)
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							state.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "credential_quota",
+								NextRecoverAt: next,
+							}
+							for _, otherState := range auth.ModelStates {
+								if otherState != nil && otherState != state {
+									otherState.Unavailable = true
+									otherState.Status = StatusError
+									otherState.StatusMessage = "invalid_api_key"
+									otherState.NextRetryAfter = next
+									otherState.Quota = QuotaState{
+										Exceeded:      true,
+										Reason:        "credential_quota",
+										NextRecoverAt: next,
+									}
+								}
+							}
+							auth.Unavailable = true
+							auth.Status = StatusError
+							auth.StatusMessage = "invalid_api_key"
+							auth.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "credential_quota",
+								NextRecoverAt: next,
+							}
+							auth.NextRetryAfter = next
 							suspendReason = "invalid_api_key"
 							shouldSuspendModel = true
 						}
@@ -920,7 +948,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelKey)
 	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelKey, suspendReason)
+		if suspendReason == "invalid_api_key" {
+			for _, m := range modelsForRegisteredAuth(result.AuthID) {
+				registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, m, suspendReason)
+			}
+			if modelKey != "" {
+				registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelKey, suspendReason)
+			}
+		} else {
+			registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, modelKey, suspendReason)
+		}
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -1888,7 +1925,26 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			next := now.Add(30 * time.Minute)
+			auth.NextRetryAfter = next
+			auth.Quota = QuotaState{
+				Exceeded:      true,
+				Reason:        "credential_quota",
+				NextRecoverAt: next,
+			}
+			for _, state := range auth.ModelStates {
+				if state != nil {
+					state.Unavailable = true
+					state.Status = StatusError
+					state.StatusMessage = "invalid_api_key"
+					state.NextRetryAfter = next
+					state.Quota = QuotaState{
+						Exceeded:      true,
+						Reason:        "credential_quota",
+						NextRecoverAt: next,
+					}
+				}
+			}
 		}
 		return
 	}

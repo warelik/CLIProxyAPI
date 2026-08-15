@@ -252,13 +252,6 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		var timer *time.Timer
 		var timedOut atomic.Bool
 
-		if ttftTimeout > 0 {
-			timer = time.AfterFunc(ttftTimeout, func() {
-				timedOut.Store(true)
-				cancelAttempt()
-			})
-		}
-
 		stopTTFT := func() {
 			if timer != nil {
 				timer.Stop()
@@ -293,6 +286,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			stopTTFT()
 			cancelAttempt()
 			return nil, errCtx
+		}
+		// Arm the TTFT timer only after local interception and request
+		// preparation: the budget measures upstream responsiveness, so a slow
+		// after-auth interceptor must not cancel the attempt before any
+		// upstream request was even made.
+		if ttftTimeout > 0 {
+			timer = time.AfterFunc(ttftTimeout, func() {
+				timedOut.Store(true)
+				cancelAttempt()
+			})
 		}
 		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 		if errStream != nil {

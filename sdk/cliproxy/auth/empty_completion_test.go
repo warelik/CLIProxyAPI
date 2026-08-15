@@ -591,6 +591,20 @@ func TestEmptyCompletionTolerantUsage(t *testing.T) {
 	}
 }
 
+func TestStreamBootstrapDetectorClaudePing(t *testing.T) {
+	var detector StreamBootstrapDetector
+	// Standard Claude keep-alive prefix; ping is non-output metadata and must
+	// not poison the bootstrap detector with sawUnknownData.
+	if detector.Observe([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")) {
+		t.Fatal("Observe() forwarded after Claude ping keep-alive")
+	}
+	// A terminal-but-empty Claude message after the ping must still be
+	// withheld as an empty completion instead of bypassing failover.
+	if detector.Observe([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")) {
+		t.Fatal("Observe() forwarded terminal empty Claude stream preceded by ping")
+	}
+}
+
 func TestStreamBootstrapStateForwardsAtMetadataLimit(t *testing.T) {
 	var state streamBootstrapState
 	metadata := []byte("data: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\"}}\n\n")

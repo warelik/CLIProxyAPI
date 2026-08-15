@@ -929,6 +929,25 @@ func TestStreamBootstrapDetectorMultilineSSE(t *testing.T) {
 			t.Fatal("IsEmptyCompletionPayload() = false for payload with event: field between data: lines")
 		}
 	})
+
+	t.Run("split event metadata and data without newline", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		fragments := [][]byte{
+			[]byte("event: response.completed"),
+			[]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"),
+		}
+		for _, f := range fragments {
+			detector.Observe(f)
+		}
+		if detector.Finish() {
+			t.Fatal("Finish() = true, want response.completed without newline not recognized as empty completion")
+		}
+
+		singlePayload := []byte("event: response.completeddata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}")
+		if IsEmptyCompletionPayload(singlePayload) {
+			t.Fatal("IsEmptyCompletionPayload() = true for single buffer with split event: and data: without newline")
+		}
+	})
 }
 
 func TestStreamBootstrapStateForwardsAtMetadataLimit(t *testing.T) {

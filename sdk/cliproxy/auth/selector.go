@@ -248,13 +248,19 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time, excluded map[string]struct{}) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time, excluded map[string]struct{}) (available map[int][]*Auth, cooldownCount int, eligibleCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
+		// Skip nil candidates before consulting the exclusion map:
+		// candidate.ID on a nil entry would panic.
+		if candidate == nil {
+			continue
+		}
 		if _, skip := excluded[candidate.ID]; skip {
 			continue
 		}
+		eligibleCount++
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
 			priority := authPriority(candidate)
@@ -268,7 +274,7 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time, excl
 			}
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, cooldownCount, eligibleCount, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, excluded ...map[string]struct{}) ([]*Auth, error) {
@@ -288,9 +294,13 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 		ex = excluded[0]
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now, ex)
+	availableByPriority, cooldownCount, eligibleCount, earliest := collectAvailableByPriority(auths, model, now, ex)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		// Count only eligible (non-excluded) auths: excluded entries are not
+		// part of the cooldown decision, otherwise the caller would get a
+		// non-retryable auth_unavailable instead of the cooldown error with
+		// Retry-After when every pickable auth is in fact cooling.
+		if eligibleCount > 0 && cooldownCount == eligibleCount && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -783,11 +793,32 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		} else {
 			newKeys = []string{cacheKey}
 		}
-		_ = s.cache.CompareAndReplaceGroup(expectedGen, expectedAuth, expectedAliases, auth.ID, newKeys...)
+		if !s.rebindGroupCAS(cacheKey, expectedGen, expectedAuth, expectedAliases, auth.ID, newKeys) {
+			entry.Infof("session-affinity: rebind lost to concurrent writer after retries | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		}
 	}
 
 	entry.Infof("session-affinity: cache miss, rebound candidate | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// rebindGroupCAS atomically rebinds a session group to authID. When the
+// compare-and-replace loses to a concurrent writer, the group is re-observed
+// and the binding retried (bounded), so the auth picked for this request is
+// not silently dropped by a stale generation.
+func (s *SessionAffinitySelector) rebindGroupCAS(sessionKey string, expectedGen uint64, expectedAuth string, expectedAliases []string, authID string, newKeys []string) bool {
+	for attempt := 0; attempt < 3; attempt++ {
+		if s.cache.CompareAndReplaceGroup(expectedGen, expectedAuth, expectedAliases, authID, newKeys...) {
+			return true
+		}
+		gen, currentAuth, aliases, ok := s.cache.Observe(sessionKey)
+		if !ok {
+			expectedGen, expectedAuth, expectedAliases = 0, "", nil
+			continue
+		}
+		expectedGen, expectedAuth, expectedAliases = gen, currentAuth, aliases
+	}
+	return false
 }
 
 // OnResult handles session affinity binding or release based on execution outcome.

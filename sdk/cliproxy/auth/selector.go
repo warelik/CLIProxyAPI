@@ -671,7 +671,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
-
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	now := time.Now()
 	excluded := extractExcludedAuthIDs(opts.Metadata)
@@ -821,10 +820,12 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
+		// Refresh TTL only while the session is still bound to this auth:
+		// a late success from a stale attempt must not steal a session that
+		// was rebound to another auth meanwhile (upstream rebound-safety fix).
+		s.cache.Touch(cacheKey, res.AuthID)
 		if fallbackKey != "" {
-			s.cache.SetAliases(res.AuthID, cacheKey, fallbackKey)
-		} else {
-			s.cache.Set(cacheKey, res.AuthID)
+			s.cache.Touch(fallbackKey, res.AuthID)
 		}
 		return
 	}

@@ -770,7 +770,19 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 }
 
+func cloneRequestMetadata(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return make(map[string]any, 4)
+	}
+	dst := make(map[string]any, len(src)+4)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel string) cliproxyexecutor.Options {
+	opts.Metadata = cloneRequestMetadata(opts.Metadata)
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
 		return opts
@@ -778,16 +790,7 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	if hasRequestedModelMetadata(opts.Metadata) {
 		return opts
 	}
-	if len(opts.Metadata) == 0 {
-		opts.Metadata = map[string]any{cliproxyexecutor.RequestedModelMetadataKey: requestedModel}
-		return opts
-	}
-	meta := make(map[string]any, len(opts.Metadata)+1)
-	for k, v := range opts.Metadata {
-		meta[k] = v
-	}
-	meta[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
-	opts.Metadata = meta
+	opts.Metadata[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
 	return opts
 }
 

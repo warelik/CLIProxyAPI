@@ -387,7 +387,8 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		// ({"choices":[], "usage":...}) never enters the loop above, so
 		// terminal would never be set and the payload would be accepted as a
 		// successful response. With usage present the response is complete, so
-		// the empty judgment can run.
+		// the empty judgment can run. (Streamed zero-choices chunks without
+		// usage are mid-stream signals and must not mark terminal here.)
 		a.terminal = true
 	}
 	return true
@@ -1005,6 +1006,18 @@ func isEmptyCompletionPayload(payload []byte) bool {
 	}
 
 	acc.evalJSON(trimmed)
+	// A complete non-SSE OpenAI chat completion body is terminal by
+	// construction: zero-choice payloads such as {"choices":[]} or
+	// {"choices":[],"usage":null} never enter the per-choice terminal paths,
+	// so without this they would be accepted as successful responses instead
+	// of being judged as empty completions. Other recognized shapes (for
+	// example Claude messages) keep their per-shape terminal rules.
+	var probe struct {
+		Choices json.RawMessage `json:"choices"`
+	}
+	if json.Unmarshal(trimmed, &probe) == nil && probe.Choices != nil {
+		acc.terminal = true
+	}
 	return acc.empty()
 }
 

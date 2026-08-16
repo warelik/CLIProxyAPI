@@ -834,6 +834,40 @@ func hasMeaningfulResponsesCallItem(item openAIResponseOutputItem) bool {
 		strings.TrimSpace(item.Result) != ""
 }
 
+func hasMeaningfulResponsesReasoningSummary(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var parts []openAIResponsePart
+	if err := json.Unmarshal(trimmed, &parts); err == nil {
+		for _, part := range parts {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var single openAIResponsePart
+	if err := json.Unmarshal(trimmed, &single); err == nil {
+		return strings.TrimSpace(single.Text) != "" || strings.TrimSpace(single.EncryptedContent) != ""
+	}
+	var strSlice []string
+	if err := json.Unmarshal(trimmed, &strSlice); err == nil {
+		for _, s := range strSlice {
+			if strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		return strings.TrimSpace(str) != ""
+	}
+	return false
+}
+
 func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOutputItem) {
 	for _, item := range items {
 		itemType := strings.ToLower(strings.TrimSpace(item.Type))
@@ -847,7 +881,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 				a.hasToolCalls = true
 			}
 		case itemType == "reasoning":
-			if strings.TrimSpace(item.EncryptedContent) != "" || nonEmptyJSONPayload(item.Summary) {
+			if strings.TrimSpace(item.EncryptedContent) != "" || hasMeaningfulResponsesReasoningSummary(item.Summary) {
 				a.hasContent = true
 			}
 		case itemType != "" && itemType != "message":

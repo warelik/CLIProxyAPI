@@ -3468,3 +3468,67 @@ func TestNonStreamMessageReasoningField(t *testing.T) {
 		}
 	})
 }
+
+func TestResponsesReasoningOutputItemDoneEmptySummary(t *testing.T) {
+	emptySummaryDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"\"}]}}\n\n")
+	meaningfulSummaryDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"real reasoning\"}]}}\n\n")
+	whitespaceSummaryDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"\\n  \\t\"}]}}\n\n")
+	encryptedSummaryDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"sig_123\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"\"}]}}\n\n")
+
+	t.Run("empty reasoning summary array in output_item.done does not mark meaningful and allows bootstrap error failover", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if detector.Observe(emptySummaryDone) {
+			t.Fatal("detector.Observe() = true for empty reasoning summary in output_item.done, want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for empty reasoning summary in output_item.done, want false")
+		}
+
+		errUpstream := errors.New("upstream failed after empty reasoning summary")
+		ch := make(chan cliproxyexecutor.StreamChunk, 2)
+		ch <- cliproxyexecutor.StreamChunk{Payload: emptySummaryDone}
+		ch <- cliproxyexecutor.StreamChunk{Err: errUpstream}
+		close(ch)
+
+		buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+		if !errors.Is(err, errUpstream) {
+			t.Fatalf("readStreamBootstrap error = %v, want %v for failover", err, errUpstream)
+		}
+		if len(buffered) != 0 {
+			t.Fatalf("readStreamBootstrap buffered = %d, want 0 on failover error", len(buffered))
+		}
+		if closed {
+			t.Fatal("readStreamBootstrap returned closed = true, want false on error")
+		}
+	})
+
+	t.Run("meaningful reasoning summary array in output_item.done marks meaningful and forwards", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if !detector.Observe(meaningfulSummaryDone) {
+			t.Fatal("detector.Observe() = false for meaningful reasoning summary in output_item.done, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for meaningful reasoning summary in output_item.done, want true")
+		}
+	})
+
+	t.Run("whitespace reasoning summary array in output_item.done does not mark meaningful", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if detector.Observe(whitespaceSummaryDone) {
+			t.Fatal("detector.Observe() = true for whitespace reasoning summary in output_item.done, want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for whitespace reasoning summary in output_item.done, want false")
+		}
+	})
+
+	t.Run("reasoning output_item.done with encrypted_content and empty summary marks meaningful", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if !detector.Observe(encryptedSummaryDone) {
+			t.Fatal("detector.Observe() = false for reasoning with encrypted_content and empty summary, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for reasoning with encrypted_content and empty summary, want true")
+		}
+	})
+}

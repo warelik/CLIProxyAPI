@@ -318,3 +318,114 @@ func TestManager_ModelSpecificSuspensionSurvivesSiblingSuccess(t *testing.T) {
 		t.Fatalf("registry model count for modelB after modelA success = %d, want 0 (suspension should survive)", count)
 	}
 }
+
+// TestManager_ModelSpecificResumableSiblingSuspensionSurvivesSiblingSuccess verifies that a
+// sibling model suspended for a resumable model-specific reason (not_found, quota,
+// payment_required) keeps its registry suspension when a different model of the same credential
+// succeeds. Only credential-wide reasons like invalid_api_key justify cross-model resumption.
+func TestManager_ModelSpecificResumableSiblingSuspensionSurvivesSiblingSuccess(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "sibling-resumable-suspension-auth"
+	modelA := "model-a2"
+	modelB := "model-b2"
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "openai", []*registry.ModelInfo{
+		{ID: modelA},
+		{ID: modelB},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       authID,
+		Provider: "openai",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			modelA: {Status: StatusActive},
+			modelB: {Status: StatusActive},
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	// Fail modelB with a resumable, model-specific reason (not_found).
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "openai",
+		Model:    modelB,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusNotFound, Code: "not_found", Message: "model b not found"},
+	})
+	if count := reg.GetModelCount(modelB); count != 0 {
+		t.Fatalf("registry model count for modelB after suspension = %d, want 0", count)
+	}
+
+	// Success on modelA -> must NOT resume modelB (model-specific reason).
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "openai",
+		Model:    modelA,
+		Success:  true,
+	})
+	if count := reg.GetModelCount(modelB); count != 0 {
+		t.Fatalf("registry model count for modelB after modelA success = %d, want 0 (model-specific suspension should survive)", count)
+	}
+	if count := reg.GetModelCount(modelA); count != 1 {
+		t.Fatalf("registry model count for modelA after success = %d, want 1", count)
+	}
+}
+
+// TestManager_CredentialWideSiblingSuspensionResumesOnSiblingSuccess verifies that a sibling
+// suspended for a credential-wide reason (invalid_api_key) is resumed by a successful request on
+// another model of the same credential.
+func TestManager_CredentialWideSiblingSuspensionResumesOnSiblingSuccess(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	authID := "sibling-credentialwide-resume-auth"
+	modelA := "model-a3"
+	modelB := "model-b3"
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "openai", []*registry.ModelInfo{
+		{ID: modelA},
+		{ID: modelB},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       authID,
+		Provider: "openai",
+		Status:   StatusActive,
+		ModelStates: map[string]*ModelState{
+			modelA: {Status: StatusActive},
+			modelB: {Status: StatusActive},
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	// Suspend sibling modelB with a genuine credential-wide reason (invalid_api_key) directly in
+	// the registry. A live invalid_api_key failure would also mark the credential with an active
+	// credential_quota cooldown that legitimately suppresses the resume path; suspending the sibling
+	// directly isolates the sibling-resume loop's reason scoping.
+	reg.SuspendClientModel(authID, modelB, "invalid_api_key")
+	if count := reg.GetModelCount(modelB); count != 0 {
+		t.Fatalf("registry model count for modelB after suspension = %d, want 0", count)
+	}
+
+	// Success on modelA -> resumes modelB (credential-wide reason).
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "openai",
+		Model:    modelA,
+		Success:  true,
+	})
+	if count := reg.GetModelCount(modelB); count != 1 {
+		t.Fatalf("registry model count for modelB after modelA success = %d, want 1 (credential-wide suspension should resume)", count)
+	}
+}

@@ -559,6 +559,47 @@ func TestRedactResponsesStreamErrorTextSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestRedactResponsesStreamErrorTextCamelCase(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "camelCase refreshToken assignment",
+			text: "refreshToken=abc",
+			want: "refreshToken=[REDACTED]",
+		},
+		{
+			name: "camelCase clientSecret colon",
+			text: "clientSecret: xyz",
+			want: "clientSecret: [REDACTED]",
+		},
+		{
+			name: "camelCase apiKey assignment",
+			text: "apiKey=secret123",
+			want: "apiKey=[REDACTED]",
+		},
+		{
+			name: "camelCase accessToken colon",
+			text: "accessToken: tok456",
+			want: "accessToken: [REDACTED]",
+		},
+		{
+			name: "non-sensitive camelCase words untouched",
+			text: "userProfile=safe statusCode: 200 maxRetries=3 donkey=safe",
+			want: "userProfile=safe statusCode: 200 maxRetries=3 donkey=safe",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactResponsesStreamErrorText(tc.text); got != tc.want {
+				t.Fatalf("redactResponsesStreamErrorText() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRedactResponsesStreamErrorTextNoPanicOnTrailingBackslash(t *testing.T) {
 	inputs := []string{
 		`token=abc\`,

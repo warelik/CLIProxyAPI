@@ -1477,7 +1477,7 @@ func isCredentialScopedError(err error) bool {
 		IsCredentialScoped() bool
 	}
 	var csp credentialScopedProvider
-	return errors.As(err, &csp) && csp != nil && csp.IsCredentialScoped()
+	return (errors.As(err, &csp) && csp != nil && csp.IsCredentialScoped()) || isInvalidAPIKeyError(err)
 }
 
 func statusCodeFromResult(err *Error) int {

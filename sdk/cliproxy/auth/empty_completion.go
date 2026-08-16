@@ -374,9 +374,10 @@ type openAIResponseUsage struct {
 }
 
 type openAIResponseContentPart struct {
-	Type    string `json:"type"`
-	Text    string `json:"text"`
-	Refusal string `json:"refusal"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text"`
+	Refusal     string            `json:"refusal"`
+	Annotations []json.RawMessage `json:"annotations"`
 }
 
 type openAIResponseOutputItem struct {
@@ -400,9 +401,10 @@ type openAIResponseObject struct {
 }
 
 type openAIResponsePart struct {
-	Type             string `json:"type"`
-	Text             string `json:"text"`
-	EncryptedContent string `json:"encrypted_content"`
+	Type             string            `json:"type"`
+	Text             string            `json:"text"`
+	EncryptedContent string            `json:"encrypted_content"`
+	Annotations      []json.RawMessage `json:"annotations"`
 }
 
 type openAIResponseChunk struct {
@@ -762,7 +764,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.content_part.added", "response.content_part.done":
 		var part openAIResponsePart
 		if err := json.Unmarshal(chunk.Part, &part); err == nil {
-			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" || hasMeaningfulAnnotations(part.Annotations) {
 				a.hasContent = true
 			}
 		}
@@ -868,6 +870,49 @@ func hasMeaningfulResponsesReasoningSummary(raw json.RawMessage) bool {
 	return false
 }
 
+func hasMeaningfulAnnotations(annotations []json.RawMessage) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+	for _, raw := range annotations {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			hasField := false
+			for _, v := range obj {
+				switch val := v.(type) {
+				case nil:
+				case string:
+					if strings.TrimSpace(val) != "" {
+						hasField = true
+					}
+				default:
+					hasField = true
+				}
+				if hasField {
+					break
+				}
+			}
+			if hasField {
+				return true
+			}
+			continue
+		}
+		var str string
+		if err := json.Unmarshal(trimmed, &str); err == nil {
+			if strings.TrimSpace(str) != "" {
+				return true
+			}
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOutputItem) {
 	for _, item := range items {
 		itemType := strings.ToLower(strings.TrimSpace(item.Type))
@@ -895,6 +940,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 		for _, part := range item.Content {
 			partType := strings.ToLower(strings.TrimSpace(part.Type))
 			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.Refusal) != "" ||
+				hasMeaningfulAnnotations(part.Annotations) ||
 				partType == "refusal" || (partType != "" && partType != "output_text" && partType != "text") {
 				a.hasContent = true
 			}

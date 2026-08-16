@@ -3532,3 +3532,95 @@ func TestResponsesReasoningOutputItemDoneEmptySummary(t *testing.T) {
 		}
 	})
 }
+
+func TestResponsesAnnotationsOutputItemAndContentPart(t *testing.T) {
+	citationContentPartDone := []byte("data: {\"type\":\"response.content_part.done\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\"}],\"logprobs\":[],\"text\":\"\"}}\n\n")
+	citationOutputItemDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\"}],\"logprobs\":[],\"text\":\"\"}],\"role\":\"assistant\"}}\n\n")
+	emptyAnnotationsPartDone := []byte("data: {\"type\":\"response.content_part.done\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"\"}}\n\n")
+	emptyAnnotationsItemDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"\"}],\"role\":\"assistant\"}}\n\n")
+	emptyObjectsAnnotationsPartDone := []byte("data: {\"type\":\"response.content_part.done\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"annotations\":[{},{}],\"logprobs\":[],\"text\":\"\"}}\n\n")
+	emptyObjectsAnnotationsItemDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[{}]}],\"role\":\"assistant\"}}\n\n")
+	normalTextPartDone := []byte("data: {\"type\":\"response.content_part.done\",\"sequence_number\":1,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"Hello world\"}}\n\n")
+	normalTextItemDone := []byte("data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"Hello world\"}],\"role\":\"assistant\"}}\n\n")
+
+	t.Run("content_part.done with text empty but annotations non-empty marks meaningful and forwards", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if !detector.Observe(citationContentPartDone) {
+			t.Fatal("detector.Observe() = false for content_part.done with annotations, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for content_part.done with annotations, want true")
+		}
+	})
+
+	t.Run("output_item.done with text empty but annotations non-empty marks meaningful and forwards", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if !detector.Observe(citationOutputItemDone) {
+			t.Fatal("detector.Observe() = false for output_item.done with annotations, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for output_item.done with annotations, want true")
+		}
+	})
+
+	t.Run("empty annotations array remains empty-eligible and allows failover", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if detector.Observe(emptyAnnotationsPartDone) {
+			t.Fatal("detector.Observe() = true for empty annotations in content_part.done, want false")
+		}
+		if detector.Observe(emptyAnnotationsItemDone) {
+			t.Fatal("detector.Observe() = true for empty annotations in output_item.done, want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for empty annotations, want false")
+		}
+
+		errUpstream := errors.New("upstream failed after empty annotations")
+		ch := make(chan cliproxyexecutor.StreamChunk, 2)
+		ch <- cliproxyexecutor.StreamChunk{Payload: emptyAnnotationsPartDone}
+		ch <- cliproxyexecutor.StreamChunk{Err: errUpstream}
+		close(ch)
+
+		buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+		if !errors.Is(err, errUpstream) {
+			t.Fatalf("readStreamBootstrap error = %v, want %v for failover", err, errUpstream)
+		}
+		if len(buffered) != 0 {
+			t.Fatalf("readStreamBootstrap buffered = %d, want 0 on failover error", len(buffered))
+		}
+		if closed {
+			t.Fatal("readStreamBootstrap returned closed = true, want false on error")
+		}
+	})
+
+	t.Run("annotations with empty objects remain empty-eligible", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		if detector.Observe(emptyObjectsAnnotationsPartDone) {
+			t.Fatal("detector.Observe() = true for empty objects in annotations (content_part.done), want false")
+		}
+		if detector.Observe(emptyObjectsAnnotationsItemDone) {
+			t.Fatal("detector.Observe() = true for empty objects in annotations (output_item.done), want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for empty objects in annotations, want false")
+		}
+	})
+
+	t.Run("normal text content path unaffected", func(t *testing.T) {
+		var d1 StreamBootstrapDetector
+		if !d1.Observe(normalTextPartDone) {
+			t.Fatal("d1.Observe() = false for normal text content_part.done, want true")
+		}
+		if !d1.HasMeaningfulOutput() {
+			t.Fatal("d1.HasMeaningfulOutput() = false for normal text content_part.done, want true")
+		}
+
+		var d2 StreamBootstrapDetector
+		if !d2.Observe(normalTextItemDone) {
+			t.Fatal("d2.Observe() = false for normal text output_item.done, want true")
+		}
+		if !d2.HasMeaningfulOutput() {
+			t.Fatal("d2.HasMeaningfulOutput() = false for normal text output_item.done, want true")
+		}
+	})
+}

@@ -451,6 +451,26 @@ func TestEmptyCompletionPredicate(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "gemini non-stream inlineData empty data scaffold is empty",
+			payload:  []byte(`{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":""}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0}}`),
+			expected: true,
+		},
+		{
+			name:     "gemini non-stream inlineData real data is not empty",
+			payload:  []byte(`{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n"}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0}}`),
+			expected: false,
+		},
+		{
+			name:     "gemini non-stream fileData empty fileUri scaffold is empty",
+			payload:  []byte(`{"candidates":[{"content":{"role":"model","parts":[{"fileData":{"mimeType":"application/pdf","fileUri":""}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0}}`),
+			expected: true,
+		},
+		{
+			name:     "gemini non-stream fileData real fileUri is not empty",
+			payload:  []byte(`{"candidates":[{"content":{"role":"model","parts":[{"fileData":{"mimeType":"application/pdf","fileUri":"gs://bucket/doc.pdf"}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0}}`),
+			expected: false,
+		},
+		{
 			name:     "gemini non-stream whitespace object inlineData part is empty",
 			payload:  []byte(`{"candidates":[{"content":{"role":"model","parts":[{"inlineData":{  }}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":0}}`),
 			expected: true,

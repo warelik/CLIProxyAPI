@@ -229,6 +229,29 @@ func hasMeaningfulToolCalls(rawCalls []json.RawMessage) bool {
 	return false
 }
 
+// hasMeaningfulGeminiMediaPayload reports whether a Gemini media part contains usable content.
+// Matching the translator semantics, inlineData counts only when data is non-blank and fileData
+// only when fileUri is non-blank; a scaffold object with only a mimeType carries no media.
+func hasMeaningfulGeminiMediaPayload(inlineData, fileData json.RawMessage) bool {
+	if len(bytes.TrimSpace(inlineData)) > 0 {
+		var v struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(inlineData, &v) == nil && strings.TrimSpace(v.Data) != "" {
+			return true
+		}
+	}
+	if len(bytes.TrimSpace(fileData)) > 0 {
+		var v struct {
+			FileURI string `json:"fileUri"`
+		}
+		if json.Unmarshal(fileData, &v) == nil && strings.TrimSpace(v.FileURI) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func isMeaningfulGeminiFunctionCall(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1203,8 +1226,7 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 				if isMeaningfulGeminiFunctionCall(part.FunctionCall) {
 					a.hasToolCalls = true
 				}
-				if nonEmptyJSONPayload(part.InlineData) ||
-					nonEmptyJSONPayload(part.FileData) ||
+				if hasMeaningfulGeminiMediaPayload(part.InlineData, part.FileData) ||
 					nonEmptyJSONPayload(part.FunctionResponse) {
 					a.hasContent = true
 				}

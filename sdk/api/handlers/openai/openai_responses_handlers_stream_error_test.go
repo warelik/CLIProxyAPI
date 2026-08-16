@@ -2107,6 +2107,41 @@ func TestRedactResponsesStreamErrorTextBearerTokens(t *testing.T) {
 			text: "password_count=5",
 			want: "password_count=5",
 		},
+		{
+			name: "url query param with leading question mark",
+			text: "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=AIzaSy1234567890abcdef",
+			want: "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=[REDACTED]",
+		},
+		{
+			name: "url query param with leading ampersand and trailing param",
+			text: "https://generativelanguage.googleapis.com/v1beta/models?version=v1&key=AIzaSy1234567890abcdef&alt=json",
+			want: "https://generativelanguage.googleapis.com/v1beta/models?version=v1&key=[REDACTED]&alt=json",
+		},
+		{
+			name: "plain key query param standalone",
+			text: "?key=AIzaSy1234567890abcdef",
+			want: "?key=[REDACTED]",
+		},
+		{
+			name: "bare key assignment",
+			text: "key=AIzaSy1234567890abcdef",
+			want: "key=[REDACTED]",
+		},
+		{
+			name: "json bare key field",
+			text: `{"key":"AIzaSy1234567890abcdef"}`,
+			want: `{"key":"[REDACTED]"}`,
+		},
+		{
+			name: "control: bare key in prose not redacted",
+			text: "the key point is that the request failed",
+			want: "the key point is that the request failed",
+		},
+		{
+			name: "control: bare key with colon in prose not redacted",
+			text: "the key: is a secret token",
+			want: "the key: is a secret token",
+		},
 	}
 
 	for _, tc := range cases {

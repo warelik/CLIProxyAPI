@@ -2067,6 +2067,46 @@ func TestRedactResponsesStreamErrorTextBearerTokens(t *testing.T) {
 			text: "the bearer is invalid",
 			want: "the bearer [REDACTED] invalid",
 		},
+		{
+			name: "json password field",
+			text: `{"password":"secret-pass-123"}`,
+			want: `{"password":"[REDACTED]"}`,
+		},
+		{
+			name: "escaped json password field",
+			text: `{\"password\":\"secret-pass-123\"}`,
+			want: `{\"password\":\"[REDACTED]\"}`,
+		},
+		{
+			name: "password assignment key-value",
+			text: "password=super-secret-pw",
+			want: "password=[REDACTED]",
+		},
+		{
+			name: "snake_case db_password",
+			text: "db_password=db-secret-pw",
+			want: "db_password=[REDACTED]",
+		},
+		{
+			name: "kebab-case db-password",
+			text: "db-password: db-secret-pw",
+			want: "db-password: [REDACTED]",
+		},
+		{
+			name: "camelCase userPassword",
+			text: `{"userPassword":"camel-secret-pw"}`,
+			want: `{"userPassword":"[REDACTED]"}`,
+		},
+		{
+			name: "control: bare password in prose not redacted",
+			text: "the password: is secret",
+			want: "the password: is secret",
+		},
+		{
+			name: "control: password_count not redacted",
+			text: "password_count=5",
+			want: "password_count=5",
+		},
 	}
 
 	for _, tc := range cases {

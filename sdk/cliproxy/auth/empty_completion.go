@@ -339,6 +339,7 @@ type geminiPart struct {
 }
 
 type geminiCandidate struct {
+	Index   *int `json:"index"`
 	Content *struct {
 		Parts []geminiPart `json:"parts"`
 	} `json:"content"`
@@ -430,22 +431,24 @@ var openAIResponseEventTypes = map[string]bool{
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
 // an OpenAI-, Claude-, or Gemini-style completion is empty.
 type emptyCompletionAccum struct {
-	expectedChoices       int
-	recognized            bool
-	sawUnknownData        bool
-	terminal              bool
-	hasContent            bool
-	hasToolCalls          bool
-	completionTokens      int
-	sawUsage              bool
-	blocked               bool
-	sawMetadataOnly       bool
-	sawMessageData        bool
-	geminiTerminal        bool
-	claudeTerminal        bool
-	openAITerminal        bool
-	openAIChoicesSeen     map[int]bool
-	openAIChoicesFinished map[int]bool
+	expectedChoices          int
+	recognized               bool
+	sawUnknownData           bool
+	terminal                 bool
+	hasContent               bool
+	hasToolCalls             bool
+	completionTokens         int
+	sawUsage                 bool
+	blocked                  bool
+	sawMetadataOnly          bool
+	sawMessageData           bool
+	geminiTerminal           bool
+	claudeTerminal           bool
+	openAITerminal           bool
+	openAIChoicesSeen        map[int]bool
+	openAIChoicesFinished    map[int]bool
+	geminiCandidatesSeen     map[int]bool
+	geminiCandidatesFinished map[int]bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -955,22 +958,32 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 		}
 	}
 
-	allTerminal := true
+	if a.geminiCandidatesSeen == nil {
+		a.geminiCandidatesSeen = make(map[int]bool)
+		a.geminiCandidatesFinished = make(map[int]bool)
+	}
+
 	blocked := false
-	for _, cand := range candidates {
-		if cand.FinishReason == nil {
-			allTerminal = false
-		} else {
+	for i, cand := range candidates {
+		idx := i
+		if cand.Index != nil {
+			idx = *cand.Index
+		}
+		a.geminiCandidatesSeen[idx] = true
+		if cand.FinishReason != nil {
 			reason := strings.TrimSpace(*cand.FinishReason)
-			if reason == "" {
-				allTerminal = false
-			} else if !strings.EqualFold(reason, "STOP") {
-				// A blocking or other terminal reason (SAFETY, RECITATION,
-				// MAX_TOKENS, BLOCKLIST, PROHIBITED_CONTENT, OTHER) is not an
-				// empty completion: the client must see the stop/block reason
-				// rather than a silent auth rotation.
-				allTerminal = false
-				blocked = true
+			if reason != "" {
+				if strings.EqualFold(reason, "STOP") {
+					a.geminiCandidatesFinished[idx] = true
+					a.terminal = true
+				} else {
+					// A blocking or other terminal reason (SAFETY, RECITATION,
+					// MAX_TOKENS, BLOCKLIST, PROHIBITED_CONTENT, OTHER) is not an
+					// empty completion: the client must see the stop/block reason
+					// rather than a silent auth rotation.
+					blocked = true
+					a.terminal = true
+				}
 			}
 		}
 		if cand.Content != nil {
@@ -996,14 +1009,22 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 		}
 	}
 
-	if allTerminal {
-		a.terminal = true
-		if !blocked {
-			a.geminiTerminal = true
-		}
-	}
 	if blocked {
 		a.blocked = true
+	}
+
+	expected := a.expectedChoices
+	if expected <= 0 {
+		expected = 1
+	}
+	targetCandidates := expected
+	if len(a.geminiCandidatesSeen) > targetCandidates {
+		targetCandidates = len(a.geminiCandidatesSeen)
+	}
+	if len(a.geminiCandidatesFinished) >= targetCandidates && len(a.geminiCandidatesFinished) >= len(a.geminiCandidatesSeen) && !a.blocked {
+		a.geminiTerminal = true
+	} else {
+		a.geminiTerminal = false
 	}
 
 	return true

@@ -3305,6 +3305,14 @@ func TestExtractExpectedChoices(t *testing.T) {
 		{name: "invalid n=0", payload: `{"n":0}`, want: 1},
 		{name: "negative n=-1", payload: `{"n":-1}`, want: 1},
 		{name: "invalid json", payload: `not json`, want: 1},
+		{name: "gemini generationConfig.candidateCount=2", payload: `{"generationConfig":{"candidateCount":2}}`, want: 2},
+		{name: "gemini generationConfig.candidate_count=3", payload: `{"generationConfig":{"candidate_count":3}}`, want: 3},
+		{name: "gemini generation_config.candidateCount=4", payload: `{"generation_config":{"candidateCount":4}}`, want: 4},
+		{name: "gemini nested request.generationConfig.candidateCount=2", payload: `{"request":{"generationConfig":{"candidateCount":2}}}`, want: 2},
+		{name: "gemini top-level candidateCount=3", payload: `{"candidateCount":3}`, want: 3},
+		{name: "gemini top-level candidate_count=5", payload: `{"candidate_count":5}`, want: 5},
+		{name: "both n=2 and candidateCount=3", payload: `{"n":2,"generationConfig":{"candidateCount":3}}`, want: 3},
+		{name: "gemini invalid candidateCount=0", payload: `{"generationConfig":{"candidateCount":0}}`, want: 1},
 	}
 
 	for _, tc := range cases {
@@ -3315,4 +3323,82 @@ func TestExtractExpectedChoices(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGeminiStreamBootstrapMultiCandidate(t *testing.T) {
+	t.Run("candidateCount=2 candidate0 STOP empty candidate1 content does not terminate at frame1", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		detector.SetRequestPayload([]byte(`{"generationConfig":{"candidateCount":2}}`))
+
+		frameCand0 := []byte("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")
+		frameCand1 := []byte("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\"hello from candidate 1\"}]}}]}\n\n")
+
+		if detector.Observe(frameCand0) {
+			t.Fatal("Observe(frameCand0) = true, want false")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = true on candidate 0 STOP when expected candidateCount=2, want false until all candidates finish")
+		}
+
+		if !detector.Observe(frameCand1) {
+			t.Fatal("Observe(frameCand1 with content) = false, want true")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = true after candidate 1 emitted content, want false")
+		}
+	})
+
+	t.Run("candidateCount=2 both candidates finish empty is terminal empty", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		detector.SetRequestPayload([]byte(`{"generationConfig":{"candidateCount":2}}`))
+
+		frameCand0 := []byte("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")
+		frameCand1 := []byte("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")
+
+		if detector.Observe(frameCand0) {
+			t.Fatal("Observe(frameCand0) = true, want false")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = true on candidate 0 STOP, want false")
+		}
+
+		if detector.Observe(frameCand1) {
+			t.Fatal("Observe(frameCand1) = true, want false")
+		}
+		if !detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = false when both candidates finished empty, want true")
+		}
+	})
+
+	t.Run("default candidateCount single candidate STOP empty is terminal empty", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		// Default candidateCount is 1
+		frameCand0 := []byte("data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n")
+
+		if detector.Observe(frameCand0) {
+			t.Fatal("Observe(frameCand0) = true, want false")
+		}
+		if !detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = false on default single candidate STOP, want true")
+		}
+	})
+
+	t.Run("candidateCount=2 single candidate arrives and stream closes reaches terminal empty on EOF", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		detector.SetRequestPayload([]byte(`{"generationConfig":{"candidateCount":2}}`))
+
+		frameCand0 := []byte("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")
+
+		if detector.Observe(frameCand0) {
+			t.Fatal("Observe(frameCand0) = true, want false")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = true mid-stream when candidateCount=2 but only candidate 0 finished, want false")
+		}
+
+		// Channel closes / EOF reached without candidate 1 ever arriving
+		if !detector.Finish() {
+			t.Fatal("Finish() at EOF = false for stream with only empty candidate 0, want true")
+		}
+	})
 }

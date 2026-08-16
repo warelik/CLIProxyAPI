@@ -115,3 +115,53 @@ func TestWrapStreamEmptyCompletionMultiChoiceDetectsEmptyWhenAllChoicesFinishEmp
 		t.Fatalf("first error = %v, want empty_completion", first.Err)
 	}
 }
+
+// TestWrapStreamEmptyCompletionGeminiMultiCandidateForwardsContentWhenCandidate1HasContent
+// verifies that when generationConfig.candidateCount=2 is requested, an early STOP chunk for candidate 0
+// does not cause an immediate empty_completion error if candidate 1 subsequently emits content.
+func TestWrapStreamEmptyCompletionGeminiMultiCandidateForwardsContentWhenCandidate1HasContent(t *testing.T) {
+	src := make(chan coreexecutor.StreamChunk, 2)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\"gemini answer\"}]}}]}\n\n")}
+	close(src)
+
+	reqPayload := []byte(`{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"candidateCount":2}}`)
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src}, reqPayload)
+
+	first, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped stream closed prematurely")
+	}
+	if first.Err != nil {
+		t.Fatalf("unexpected error on first chunk: %v", first.Err)
+	}
+	second, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped stream missing second chunk")
+	}
+	if string(second.Payload) != "data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[{\"text\":\"gemini answer\"}]}}]}\n\n" {
+		t.Fatalf("second payload = %q, want candidate 1 content", second.Payload)
+	}
+}
+
+// TestWrapStreamEmptyCompletionGeminiMultiCandidateDetectsEmptyWhenAllCandidatesFinishEmpty
+// verifies that when candidateCount=2 is requested and both candidates finish empty,
+// wrapStreamEmptyCompletion correctly detects empty completion.
+func TestWrapStreamEmptyCompletionGeminiMultiCandidateDetectsEmptyWhenAllCandidatesFinishEmpty(t *testing.T) {
+	src := make(chan coreexecutor.StreamChunk, 2)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"candidates\":[{\"index\":0,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"candidates\":[{\"index\":1,\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n")}
+	close(src)
+
+	reqPayload := []byte(`{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"candidateCount":2}}`)
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src}, reqPayload)
+
+	first, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped multi-candidate empty stream closed without empty_completion error")
+	}
+	var authErr *coreauth.Error
+	if !errors.As(first.Err, &authErr) || authErr.Code != "empty_completion" {
+		t.Fatalf("first error = %v, want empty_completion", first.Err)
+	}
+}

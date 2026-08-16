@@ -19,27 +19,75 @@ func EmptyCompletionError() error {
 	return errEmptyCompletion
 }
 
-// ExtractExpectedChoices parses the request payload to extract the "n" (choice count) parameter.
-// Returns 1 if payload is empty, invalid, or "n" is omitted/<=0.
+type choiceExtractionPayload struct {
+	N                *int `json:"n"`
+	CandidateCount   *int `json:"candidateCount"`
+	Candidate_Count  *int `json:"candidate_count"`
+	GenerationConfig *struct {
+		CandidateCount  *int `json:"candidateCount"`
+		Candidate_Count *int `json:"candidate_count"`
+	} `json:"generationConfig"`
+	Generation_Config *struct {
+		CandidateCount  *int `json:"candidateCount"`
+		Candidate_Count *int `json:"candidate_count"`
+	} `json:"generation_config"`
+	Request *struct {
+		N                *int `json:"n"`
+		CandidateCount   *int `json:"candidateCount"`
+		Candidate_Count  *int `json:"candidate_count"`
+		GenerationConfig *struct {
+			CandidateCount  *int `json:"candidateCount"`
+			Candidate_Count *int `json:"candidate_count"`
+		} `json:"generationConfig"`
+		Generation_Config *struct {
+			CandidateCount  *int `json:"candidateCount"`
+			Candidate_Count *int `json:"candidate_count"`
+		} `json:"generation_config"`
+	} `json:"request"`
+}
+
+// ExtractExpectedChoices parses the request payload to extract the choice count parameter
+// (top-level "n" for OpenAI or "generationConfig.candidateCount" for Gemini).
+// Returns 1 if payload is empty, invalid, or choice count is omitted/<=0.
 func ExtractExpectedChoices(payload []byte) int {
 	if len(payload) == 0 {
 		return 1
 	}
-	var req struct {
-		N       *int `json:"n"`
-		Request *struct {
-			N *int `json:"n"`
-		} `json:"request"`
+	var req choiceExtractionPayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return 1
 	}
-	if err := json.Unmarshal(payload, &req); err == nil {
-		if req.N != nil && *req.N > 0 {
-			return *req.N
-		}
-		if req.Request != nil && req.Request.N != nil && *req.Request.N > 0 {
-			return *req.Request.N
+	maxChoices := 1
+	updateMax := func(ptr *int) {
+		if ptr != nil && *ptr > maxChoices {
+			maxChoices = *ptr
 		}
 	}
-	return 1
+	updateMax(req.N)
+	updateMax(req.CandidateCount)
+	updateMax(req.Candidate_Count)
+	if req.GenerationConfig != nil {
+		updateMax(req.GenerationConfig.CandidateCount)
+		updateMax(req.GenerationConfig.Candidate_Count)
+	}
+	if req.Generation_Config != nil {
+		updateMax(req.Generation_Config.CandidateCount)
+		updateMax(req.Generation_Config.Candidate_Count)
+	}
+	if req.Request != nil {
+		updateMax(req.Request.N)
+		updateMax(req.Request.CandidateCount)
+		updateMax(req.Request.Candidate_Count)
+		if req.Request.GenerationConfig != nil {
+			updateMax(req.Request.GenerationConfig.CandidateCount)
+			updateMax(req.Request.GenerationConfig.Candidate_Count)
+		}
+		if req.Request.Generation_Config != nil {
+			updateMax(req.Request.Generation_Config.CandidateCount)
+			updateMax(req.Request.Generation_Config.Candidate_Count)
+		}
+	}
+	return maxChoices
 }
 
 // StreamBootstrapDetector incrementally classifies a stream prefix without

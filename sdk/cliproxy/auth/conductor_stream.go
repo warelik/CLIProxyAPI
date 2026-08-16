@@ -546,6 +546,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			discardStreamChunks(streamResult.Chunks)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -557,6 +558,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		remaining := streamResult.Chunks
 		if closed {
+			discardStreamChunks(streamResult.Chunks)
 			closedCh := make(chan cliproxyexecutor.StreamChunk)
 			close(closedCh)
 			remaining = closedCh

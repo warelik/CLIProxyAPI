@@ -801,7 +801,11 @@ var (
 	responsesStreamAuthSchemePattern = regexp.MustCompile(`(?i)^(Bearer|Basic)\s+`)
 	// responsesStreamAuthPattern redacts standalone Bearer/Basic credentials
 	// that appear outside key/value contexts (e.g. embedded in event names).
-	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([-A-Za-z0-9._~+/=]{3,})`)
+	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([-A-Za-z0-9._~+/=]+)`)
+	// responsesStreamAuthDenyWords marks prose words that follow Bearer/Basic in
+	// natural English ("bearer of bad news", "the bearer to the manager") so
+	// prose is not misclassified as a standalone credential.
+	responsesStreamAuthDenyWords = regexp.MustCompile(`(?i)^(?:of|to|in|is|and|the|for|from|with|by|at|or)$`)
 )
 
 func truncateResponsesStreamErrorText(text string, limit int) string {
@@ -814,7 +818,16 @@ func truncateResponsesStreamErrorText(text string, limit int) string {
 
 func redactResponsesStreamErrorText(text string) string {
 	text = redactResponsesStreamKeyValues(text)
-	return responsesStreamAuthPattern.ReplaceAllString(text, `${1}[REDACTED]`)
+	return responsesStreamAuthPattern.ReplaceAllStringFunc(text, func(m string) string {
+		sub := responsesStreamAuthPattern.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		if responsesStreamAuthDenyWords.MatchString(sub[2]) {
+			return m
+		}
+		return sub[1] + "[REDACTED]"
+	})
 }
 
 // redactResponsesStreamKeyValues locates sensitive key/value pairs and replaces

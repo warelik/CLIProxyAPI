@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -758,5 +759,21 @@ func TestRouteExhaustion_GenericOutermostHeadersClone(t *testing.T) {
 	}
 	if inner.headers.Get("Inner") != "1" {
 		t.Fatalf("inner caller map mutated: got %q", inner.headers.Get("Inner"))
+	}
+}
+
+func TestRouteExhaustion_PreservesStructuredJSONRequestFault(t *testing.T) {
+	tracker := newRouteAttemptTracker()
+	tracker.Record(&Auth{Provider: "openai"}, &Error{HTTPStatus: 502})
+
+	rawJSON := `{"error":{"type":"invalid_request_error","code":"cyber_policy","message":"blocked"}}`
+	cause := errors.New(rawJSON)
+	wrapped := wrapRouteExhaustion(cause, tracker)
+
+	if !json.Valid([]byte(wrapped.Error())) {
+		t.Fatalf("wrapped.Error() corrupted structured JSON: %s", wrapped.Error())
+	}
+	if wrapped.Error() != rawJSON {
+		t.Fatalf("wrapped.Error() = %q, want original %q", wrapped.Error(), rawJSON)
 	}
 }

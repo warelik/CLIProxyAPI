@@ -3244,4 +3244,26 @@ func TestEmptyCompletion_OpenAIFinishReasonStopWithoutDoneIsTerminalEmpty(t *tes
 	if detectorFilter.IsTerminalEmpty() {
 		t.Fatal("IsTerminalEmpty() = true, want false for content_filter")
 	}
+
+	// Case 4: Multi-choice with separate frames where frame1 has choice 0 finished empty
+	// and frame2 has choice 1 with content. Frame 1 must NOT trigger IsTerminalEmpty().
+	var detectorMulti StreamBootstrapDetector
+	frame0 := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{}},{\"index\":1,\"delta\":{}}]}\n\n")
+	if detectorMulti.Observe(frame0) {
+		t.Fatal("Observe(frame0) = true, want false for empty metadata")
+	}
+	frame1 := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	if detectorMulti.Observe(frame1) {
+		t.Fatal("Observe(frame1) = true, want false for choice 0 finish")
+	}
+	if detectorMulti.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = true on frame1, want false when choice 1 has not finished yet")
+	}
+	frame2 := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":1,\"delta\":{\"content\":\"hello\"}}]}\n\n")
+	if !detectorMulti.Observe(frame2) {
+		t.Fatal("Observe(frame2) = false, want true for choice 1 content")
+	}
+	if detectorMulti.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = true after content received, want false")
+	}
 }

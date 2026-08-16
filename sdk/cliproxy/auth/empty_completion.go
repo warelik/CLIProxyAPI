@@ -77,6 +77,7 @@ const maxStreamBootstrapBytes = 1 << 20
 // completions.
 type openAIChunk struct {
 	Choices []struct {
+		Index *int   `json:"index"`
 		Text  string `json:"text"`
 		Delta struct {
 			Content          string            `json:"content"`
@@ -429,19 +430,21 @@ var openAIResponseEventTypes = map[string]bool{
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
 // an OpenAI-, Claude-, or Gemini-style completion is empty.
 type emptyCompletionAccum struct {
-	recognized       bool
-	sawUnknownData   bool
-	terminal         bool
-	hasContent       bool
-	hasToolCalls     bool
-	completionTokens int
-	sawUsage         bool
-	blocked          bool
-	sawMetadataOnly  bool
-	sawMessageData   bool
-	geminiTerminal   bool
-	claudeTerminal   bool
-	openAITerminal   bool
+	recognized            bool
+	sawUnknownData        bool
+	terminal              bool
+	hasContent            bool
+	hasToolCalls          bool
+	completionTokens      int
+	sawUsage              bool
+	blocked               bool
+	sawMetadataOnly       bool
+	sawMessageData        bool
+	geminiTerminal        bool
+	claudeTerminal        bool
+	openAITerminal        bool
+	openAIChoicesSeen     map[int]bool
+	openAIChoicesFinished map[int]bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -506,11 +509,20 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		a.sawUsage = true
 		a.addUsage(*chunk.Usage.CompletionTokens)
 	}
-	allTerminal := len(chunk.Choices) > 0
-	for _, ch := range chunk.Choices {
+	if a.openAIChoicesSeen == nil {
+		a.openAIChoicesSeen = make(map[int]bool)
+		a.openAIChoicesFinished = make(map[int]bool)
+	}
+	for i, ch := range chunk.Choices {
+		idx := i
+		if ch.Index != nil {
+			idx = *ch.Index
+		}
+		a.openAIChoicesSeen[idx] = true
 		if ch.FinishReason != nil {
 			reason := strings.TrimSpace(*ch.FinishReason)
 			if strings.EqualFold(reason, "stop") || strings.EqualFold(reason, "tool_calls") || strings.EqualFold(reason, "function_call") {
+				a.openAIChoicesFinished[idx] = true
 				a.terminal = true
 			} else if reason != "" {
 				// content_filter, length, and other non-stop terminal reasons
@@ -518,11 +530,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 				// rather than a silent auth rotation.
 				a.blocked = true
 				a.terminal = true
-			} else {
-				allTerminal = false
 			}
-		} else {
-			allTerminal = false
 		}
 		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent
 		if strings.TrimSpace(content) != "" {
@@ -545,8 +553,10 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 			a.hasContent = true
 		}
 	}
-	if allTerminal && !a.blocked {
+	if len(a.openAIChoicesSeen) > 0 && len(a.openAIChoicesFinished) == len(a.openAIChoicesSeen) && !a.blocked {
 		a.openAITerminal = true
+	} else {
+		a.openAITerminal = false
 	}
 	if len(chunk.Choices) == 0 && chunk.Usage != nil {
 		// A completed non-streaming payload with zero choices

@@ -590,6 +590,41 @@ func TestRedactResponsesStreamErrorTextCamelCase(t *testing.T) {
 			text: "userProfile=safe statusCode: 200 maxRetries=3 donkey=safe",
 			want: "userProfile=safe statusCode: 200 maxRetries=3 donkey=safe",
 		},
+		{
+			name: "acronym-prefixed IDToken assignment",
+			text: "IDToken=abc",
+			want: "IDToken=[REDACTED]",
+		},
+		{
+			name: "acronym-prefixed JWTToken colon",
+			text: "JWTToken: xyz",
+			want: "JWTToken: [REDACTED]",
+		},
+		{
+			name: "acronym-prefixed XApiKey assignment",
+			text: "XApiKey=secret",
+			want: "XApiKey=[REDACTED]",
+		},
+		{
+			name: "acronym-prefixed XAPIKey assignment",
+			text: "XAPIKey=secret",
+			want: "XAPIKey=[REDACTED]",
+		},
+		{
+			name: "acronym-prefixed OAuthToken assignment",
+			text: "OAuthToken=secret",
+			want: "OAuthToken=[REDACTED]",
+		},
+		{
+			name: "Keyboard assignment untouched",
+			text: "Keyboard=mechanical",
+			want: "Keyboard=mechanical",
+		},
+		{
+			name: "prose mentioning API key untouched",
+			text: "the API key rotated recently",
+			want: "the API key rotated recently",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -784,7 +784,7 @@ var (
 	// (= or :), preceded by a boundary and optional quote/escape syntax.
 	// Group 1 is the leading boundary/quote syntax, group 2 the key, group 3
 	// the trailing quote/space syntax plus separator.
-	responsesStreamKeyPattern = regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9_])(?:\\*["']?)?)(api[_-]?key|apikey|access[_-]?key[_-]?id|aws[_-]?access[_-]?key[_-]?id|api[_-]?key[_-]?id|access[_-]?token|authorization|token|secret|credential|password|key|aws[_-]?credential|refresh[_-]?token|client[_-]?secret|(?:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*)[_-](?:key|token|secret|credential|password|key[_-]?id)|(?-i:[A-Za-z0-9]*(?:[a-z0-9]|_[a-z0-9]|-[a-z0-9])(?:Key|Token|Secret|Credential|Password|KeyId|Key_Id|Key-Id)))((?:\\*["']?)?\s*[=:])`)
+	responsesStreamKeyPattern = regexp.MustCompile(`(?i)((?:^|[^A-Za-z0-9_])(?:\\*["']?)?)(api[_-]?key|apikey|access[_-]?key[_-]?id|aws[_-]?access[_-]?key[_-]?id|api[_-]?key[_-]?id|access[_-]?token|authorization|token|secret|credential|password|key|aws[_-]?credential|refresh[_-]?token|client[_-]?secret|(?:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*)[_-](?:key|token|secret|credential|password|key[_-]?id)|(?-i:(?:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*)(?:Key|Token|Secret|Credential|Password|KeyId|Key_Id|Key-Id|ApiKey|Api_Key|Api-Key|APIKey|API_Key|API-Key)))((?:\\*["']?)?\s*[=:])`)
 	// responsesStreamSpaceAPIKeyPattern matches the "api key:" spelling with a
 	// space between api and key, in header/assignment contexts. Group 1 is the
 	// boundary, group 2 the key, group 3 the separator — mirroring

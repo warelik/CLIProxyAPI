@@ -867,7 +867,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		var item openAIResponseOutputItem
 		if err := json.Unmarshal(chunk.Item, &item); err == nil {
 			itemType := strings.ToLower(strings.TrimSpace(item.Type))
-			if strings.HasSuffix(itemType, "_call") {
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
 				if hasMeaningfulResponsesCallItem(item) {
 					a.hasToolCalls = true
 				}
@@ -875,7 +875,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 		}
 		if err := json.Unmarshal(chunk.Output, &item); err == nil {
 			itemType := strings.ToLower(strings.TrimSpace(item.Type))
-			if strings.HasSuffix(itemType, "_call") {
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
 				if hasMeaningfulResponsesCallItem(item) {
 					a.hasToolCalls = true
 				}
@@ -929,6 +929,10 @@ func hasMeaningfulResponsesCallItem(item openAIResponseOutputItem) bool {
 		hasMeaningfulJSONArguments(item.Arguments) ||
 		strings.TrimSpace(item.Input) != "" ||
 		strings.TrimSpace(item.Result) != ""
+}
+
+func hasMeaningfulResponsesImageGenerationCallItem(item openAIResponseOutputItem) bool {
+	return strings.TrimSpace(item.Result) != "" || strings.TrimSpace(item.Text) != ""
 }
 
 func hasMeaningfulResponsesReasoningSummary(raw json.RawMessage) bool {
@@ -1013,7 +1017,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOu
 		itemType := strings.ToLower(strings.TrimSpace(item.Type))
 		switch {
 		case itemType == "image_generation_call":
-			if hasMeaningfulResponsesCallItem(item) || strings.TrimSpace(item.Text) != "" {
+			if hasMeaningfulResponsesImageGenerationCallItem(item) {
 				a.hasContent = true
 			}
 		case strings.HasSuffix(itemType, "_call"):

@@ -706,6 +706,21 @@ func TestEmptyCompletionPredicate(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "image_generation_call stream empty result is empty",
+			payload:  []byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_1\",\"call_id\":\"call_1\",\"result\":\"\"}}\n\ndata: [DONE]\n\n"),
+			expected: true,
+		},
+		{
+			name:     "image_generation_call stream result is not empty",
+			payload:  []byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_1\",\"call_id\":\"call_1\",\"result\":\"{\\\"image_ref\\\":\\\"file-abc\\\"}\"}}\n\ndata: [DONE]\n\n"),
+			expected: false,
+		},
+		{
+			name:     "image_generation_call stream omitted result is empty",
+			payload:  []byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"id\":\"call_1\",\"call_id\":\"call_1\"}}\n\ndata: [DONE]\n\n"),
+			expected: true,
+		},
+		{
 			name:     "gemini sse empty candidates array is empty",
 			payload:  []byte("data: {\"candidates\":[],\"usageMetadata\":{\"candidatesTokenCount\":0}}\n\n"),
 			expected: true,

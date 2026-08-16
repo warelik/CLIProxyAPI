@@ -801,7 +801,7 @@ var (
 	responsesStreamAuthSchemePattern = regexp.MustCompile(`(?i)^(Bearer|Basic)\s+`)
 	// responsesStreamAuthPattern redacts standalone Bearer/Basic credentials
 	// that appear outside key/value contexts (e.g. embedded in event names).
-	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([^\s,;"'\\]*[0-9A-Z._~+/=-][^\s,;"'\\]*)`)
+	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([-A-Za-z0-9._~+/=]{3,})`)
 )
 
 func truncateResponsesStreamErrorText(text string, limit int) string {

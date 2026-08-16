@@ -703,7 +703,7 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 			}
 		}
 	case "response.function_call_arguments.delta", "response.function_call_arguments.done":
-		if strings.TrimSpace(chunk.Delta) != "" || strings.TrimSpace(chunk.Arguments) != "" || a.hasToolCalls {
+		if a.hasToolCalls || hasMeaningfulJSONArguments(chunk.Delta) || hasMeaningfulJSONArguments(chunk.Arguments) {
 			a.hasToolCalls = true
 		}
 	}
@@ -1054,6 +1054,7 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 			s.acc.recognized = true
 			s.acc.terminal = true
 			s.acc.sawMessageData = true
+			s.sawDone = true
 		} else {
 			s.acc.sawMetadataOnly = true
 		}
@@ -1372,6 +1373,7 @@ func (a *emptyCompletionAccum) evalSSE(payload []byte) {
 			event := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:")))
 			if bytes.Equal(event, []byte("message_stop")) {
 				a.recognized = true
+				a.terminal = true
 				a.sawMessageData = true
 			} else {
 				a.sawMetadataOnly = true

@@ -357,6 +357,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
 					didRefreshOnUnauthorized = true
 					restartAttempt()
+					if streamResult != nil {
+						discardStreamChunks(streamResult.Chunks)
+					}
 					streamResult, errStream = executor.ExecuteStream(attemptCtx, auth, execReq, execOpts)
 					errStream = checkTTFTErr(errStream)
 					if errStream != nil {

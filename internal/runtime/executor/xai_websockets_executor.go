@@ -48,12 +48,35 @@ type xaiWebsocketIDStateStore struct {
 }
 
 type xaiWebsocketIDState struct {
-	requestMu                        sync.Mutex
+	requestMuInit                    sync.Once
+	requestSem                       chan struct{}
 	mu                               sync.Mutex
 	downstreamToUpstream             map[string]string
 	sequence                         int
 	transcriptInput                  []json.RawMessage
 	replayCompactedTranscriptOnReset bool
+}
+
+func (s *xaiWebsocketIDState) initRequestSem() {
+	s.requestMuInit.Do(func() {
+		s.requestSem = make(chan struct{}, 1)
+		s.requestSem <- struct{}{}
+	})
+}
+
+func (s *xaiWebsocketIDState) lockRequest(ctx context.Context) error {
+	s.initRequestSem()
+	select {
+	case <-s.requestSem:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *xaiWebsocketIDState) unlockRequest() {
+	s.initRequestSem()
+	s.requestSem <- struct{}{}
 }
 
 type xaiWebsocketRequestIDMapper struct {
@@ -439,12 +462,14 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	stateRequestLocked := false
 	stateRequestLockTransferred := false
 	if executionSessionID == "" && state != nil {
-		state.requestMu.Lock()
+		if err := state.lockRequest(ctx); err != nil {
+			return nil, err
+		}
 		stateRequestLocked = true
 	}
 	defer func() {
 		if stateRequestLocked && !stateRequestLockTransferred {
-			state.requestMu.Unlock()
+			state.unlockRequest()
 		}
 	}()
 	if xaiInputHasItemType(req.Payload, "compaction_trigger") {
@@ -667,7 +692,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	}
 	go func() {
 		if stateRequestLocked {
-			defer state.requestMu.Unlock()
+			defer state.unlockRequest()
 		}
 		terminateReason := "completed"
 		var terminateErr error

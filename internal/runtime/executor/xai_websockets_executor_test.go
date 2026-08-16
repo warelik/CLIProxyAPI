@@ -1722,3 +1722,44 @@ func TestXAIWebsocketsExecuteStreamStopsOnBareErrorPayload(t *testing.T) {
 		t.Fatal("timed out waiting for bare upstream error")
 	}
 }
+
+// TestXAIWebsocketIDStateConcurrentLockContextCancellation is a red-proof regression test for the
+// non-context-aware per-state request lock (formerly state.requestMu). When two xAI requests derive the same stateSessionID
+// (no execution_session_id), the second blocks on the per-state lock; a stream-connect-timeout
+// cancels only the attempt context, which a sync.Mutex does not observe, leaving the request
+// stuck indefinitely. The lock must be cancellable via the request context.
+func TestXAIWebsocketIDStateConcurrentLockContextCancellation(t *testing.T) {
+	state := &xaiWebsocketIDState{}
+	if err := state.lockRequest(context.Background()); err != nil {
+		t.Fatalf("first lockRequest: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(blocked)
+		done <- state.lockRequest(ctx)
+	}()
+	<-blocked
+	// At this point the waiter is inside lockRequest; it can only acquire the semaphore or
+	// observe cancellation, never both.
+	cancel()
+	select {
+	case errLock := <-done:
+		if errLock == nil {
+			t.Fatal("second lockRequest succeeded despite cancelled context")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second lockRequest did not observe cancellation (still blocked)")
+	}
+
+	// Unlock the holder and verify the released semaphore can be reacquired normally.
+	state.unlockRequest()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	if err := state.lockRequest(ctx2); err != nil {
+		t.Fatalf("lockRequest after unlock: %v", err)
+	}
+	state.unlockRequest()
+}

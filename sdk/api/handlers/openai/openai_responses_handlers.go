@@ -802,9 +802,6 @@ var (
 	// responsesStreamAuthPattern redacts standalone Bearer/Basic credentials
 	// that appear outside key/value contexts (e.g. embedded in event names).
 	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([-A-Za-z0-9._~+/=]+)`)
-	// responsesStreamProseFollowPattern detects when a lowercase scheme is
-	// followed by natural prose words ("bearer of bad news", "the bearer to the manager").
-	responsesStreamProseFollowPattern = regexp.MustCompile(`^\s+[a-z]+`)
 )
 
 func truncateResponsesStreamErrorText(text string, limit int) string {
@@ -817,33 +814,7 @@ func truncateResponsesStreamErrorText(text string, limit int) string {
 
 func redactResponsesStreamErrorText(text string) string {
 	text = redactResponsesStreamKeyValues(text)
-	locs := responsesStreamAuthPattern.FindAllStringSubmatchIndex(text, -1)
-	if len(locs) == 0 {
-		return text
-	}
-	var b strings.Builder
-	b.Grow(len(text))
-	last := 0
-	for _, loc := range locs {
-		matchStart, matchEnd := loc[0], loc[1]
-		if matchStart < last {
-			continue
-		}
-		scheme := text[loc[2]:loc[3]]
-		tail := text[matchEnd:]
-		// Prose check: lowercase scheme ("bearer", "basic") followed by space + lowercase prose words
-		if scheme[0] >= 'a' && scheme[0] <= 'z' && responsesStreamProseFollowPattern.MatchString(tail) {
-			b.WriteString(text[last:matchEnd])
-			last = matchEnd
-			continue
-		}
-		b.WriteString(text[last:loc[2]])
-		b.WriteString(scheme)
-		b.WriteString("[REDACTED]")
-		last = matchEnd
-	}
-	b.WriteString(text[last:])
-	return b.String()
+	return responsesStreamAuthPattern.ReplaceAllString(text, "${1}[REDACTED]")
 }
 
 // redactResponsesStreamKeyValues locates sensitive key/value pairs and replaces

@@ -1906,9 +1906,9 @@ func TestCodexWebsocketHandshakeFailureReleasesSessionRequestLock(t *testing.T) 
 			sess := exec.getOrCreateSession("failed-handshake")
 			acquired := make(chan struct{})
 			go func() {
-				sess.reqMu.Lock()
+				_ = sess.lockRequest(context.Background())
 				close(acquired)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 			}()
 			select {
 			case <-acquired:
@@ -2128,13 +2128,96 @@ func TestCodexWebsocketLifecycleBindFailureReleasesSessionRequestLock(t *testing
 	sess := exec.getOrCreateSession("bind-failed")
 	acquired := make(chan struct{})
 	go func() {
-		sess.reqMu.Lock()
+		_ = sess.lockRequest(context.Background())
 		close(acquired)
-		sess.reqMu.Unlock()
+		sess.unlockRequest()
 	}()
 	select {
 	case <-acquired:
 	case <-time.After(time.Second):
 		t.Fatal("lifecycle bind failure left the session request lock held")
+	}
+}
+
+func TestCodexWebsocketConcurrentStreamContextCancellation(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if gjson.GetBytes(msg, "type").String() == "response.create" {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_item.added","item":{"type":"message","id":"msg_1"}}`))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"part 1"}`))
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`)}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "concurrent-session",
+		},
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	res1, err1 := exec.ExecuteStream(ctx1, auth, req, opts)
+	if err1 != nil {
+		t.Fatalf("first ExecuteStream failed: %v", err1)
+	}
+
+	// Read one chunk from first stream so it is actively streaming and holding lock
+	chunk := <-res1.Chunks
+	if chunk.Err != nil {
+		t.Fatalf("first stream chunk err = %v", chunk.Err)
+	}
+
+	// Start second request with a short timeout context on the same session
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+
+	start := time.Now()
+	_, err2 := exec.ExecuteStream(ctx2, auth, req, opts)
+	elapsed := time.Since(start)
+
+	if err2 == nil {
+		t.Fatal("second ExecuteStream succeeded while first stream active, want error")
+	}
+	if !errors.Is(err2, context.DeadlineExceeded) && !errors.Is(err2, context.Canceled) {
+		t.Fatalf("second ExecuteStream err = %v, want context timeout/cancel", err2)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("second ExecuteStream blocked for %v, want return on context timeout ~50ms", elapsed)
+	}
+
+	// Now cancel stream 1 so it releases the lock
+	cancel1()
+	for range res1.Chunks {
+	}
+
+	// Normal serialized request should now succeed
+	ctx3, cancel3 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel3()
+	res3, err3 := exec.ExecuteStream(ctx3, auth, req, opts)
+	if err3 != nil {
+		t.Fatalf("third ExecuteStream failed after session released: %v", err3)
+	}
+	chunk3 := <-res3.Chunks
+	if chunk3.Err != nil {
+		t.Fatalf("third stream chunk err = %v", chunk3.Err)
 	}
 }

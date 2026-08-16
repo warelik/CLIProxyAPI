@@ -101,15 +101,19 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	sessionLocked := false
 	unlockSession := func() {
 		if sess != nil && sessionLocked {
-			sess.reqMu.Unlock()
+			sess.unlockRequest()
 			sessionLocked = false
 		}
 	}
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
-		sess.reqMu.Lock()
-		sessionLocked = true
-		defer unlockSession()
+		if sess != nil {
+			if err := sess.lockRequest(ctx); err != nil {
+				return cliproxyexecutor.Response{}, err
+			}
+			sessionLocked = true
+			defer unlockSession()
+		}
 	}
 
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)

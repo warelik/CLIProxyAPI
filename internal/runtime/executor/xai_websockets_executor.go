@@ -454,8 +454,10 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		if executionSessionID != "" {
 			sess := e.getOrCreateSession(executionSessionID)
 			if sess != nil {
-				sess.reqMu.Lock()
-				defer sess.reqMu.Unlock()
+				if err := sess.lockRequest(ctx); err != nil {
+					return nil, err
+				}
+				defer sess.unlockRequest()
 			}
 		}
 		idMapper := newXAIWebsocketRequestIDMapper(e.idStore, stateSessionID, req.Payload)
@@ -495,7 +497,9 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if executionSessionID != "" {
 		sess = e.getOrCreateSession(executionSessionID)
 		if sess != nil {
-			sess.reqMu.Lock()
+			if err := sess.lockRequest(ctx); err != nil {
+				return nil, err
+			}
 		}
 	}
 	idMapper := newXAIWebsocketRequestIDMapper(e.idStore, stateSessionID, req.Payload)
@@ -536,7 +540,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL)
 		if conn == nil {
 			if sess != nil {
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 			}
 			return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
@@ -554,19 +558,19 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			if sess != nil {
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 			}
 			return nil, xaiStatusErr(respHS.StatusCode, bodyErr)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
-			sess.reqMu.Unlock()
+			sess.unlockRequest()
 		}
 		return nil, errDial
 	}
 	if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 		if sess != nil {
-			sess.reqMu.Unlock()
+			sess.unlockRequest()
 		}
 		closeWebsocketAfterBindFailure(sess, conn, closer)
 		return nil, errBind
@@ -590,7 +594,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
 				e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "send_error", errSend)
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				if !shouldRetryXAIWebsocketSend(errSend) {
 					return nil, errSend
 				}
@@ -599,7 +603,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 			if !shouldRetryXAIWebsocketSend(errSend) {
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				return nil, errSend
 			}
 			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
@@ -608,7 +612,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				closeHTTPResponseBody(respHSRetry, "xai websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
 					return nil, xaiStatusErr(respHSRetry.StatusCode, bodyErrRetry)
 				}
@@ -619,7 +623,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			closer = closerRetry
 			if errBind := sess.bindExecutionLifecycle(opts, conn, closer, req.Model); errBind != nil {
 				clearRetryActiveState(sess, previousConn, previousReadCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				closeWebsocketAfterBindFailure(sess, conn, closer)
 				return nil, errBind
 			}
@@ -644,7 +648,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				return nil, errSendRetry
 			}
 			wsReqBody = wsReqBodyRetry
@@ -672,7 +676,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		defer func() {
 			if sess != nil {
 				sess.clearActive(conn, readCh)
-				sess.reqMu.Unlock()
+				sess.unlockRequest()
 				return
 			}
 			logXAIWebsocketDisconnected(executionSessionID, authID, wsURL, terminateReason, terminateErr)
@@ -1075,8 +1079,10 @@ func (e *XAIWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWebso
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
+		reqSem:               make(chan struct{}, 1),
 		upstreamDisconnectCh: make(chan error, 1),
 	}
+	sess.reqSem <- struct{}{}
 	store.sessions[sessionID] = sess
 	return sess
 }

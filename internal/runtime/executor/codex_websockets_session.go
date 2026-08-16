@@ -49,7 +49,8 @@ func (c *websocketConnectionCloser) Close() error {
 type codexWebsocketSession struct {
 	sessionID string
 
-	reqMu sync.Mutex
+	reqMuInit sync.Once
+	reqSem    chan struct{}
 
 	connMu                    sync.Mutex
 	conn                      *websocket.Conn
@@ -76,6 +77,51 @@ type codexWebsocketSession struct {
 	upstreamDisconnectErrMu   sync.RWMutex
 	upstreamDisconnectErrConn *websocket.Conn
 	upstreamDisconnectErr     error
+}
+
+func (s *codexWebsocketSession) initReqSem() chan struct{} {
+	s.reqMuInit.Do(func() {
+		if s.reqSem == nil {
+			s.reqSem = make(chan struct{}, 1)
+			s.reqSem <- struct{}{}
+		}
+	})
+	return s.reqSem
+}
+
+func (s *codexWebsocketSession) lockRequest(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	sem := s.initReqSem()
+	if ctx == nil {
+		<-sem
+		return nil
+	}
+	select {
+	case <-sem:
+		if err := ctx.Err(); err != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+			}
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *codexWebsocketSession) unlockRequest() {
+	if s == nil {
+		return
+	}
+	sem := s.initReqSem()
+	select {
+	case sem <- struct{}{}:
+	default:
+	}
 }
 
 type codexWebsocketRead struct {
@@ -468,8 +514,10 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	}
 	sess := &codexWebsocketSession{
 		sessionID:            sessionID,
+		reqSem:               make(chan struct{}, 1),
 		upstreamDisconnectCh: make(chan error, 1),
 	}
+	sess.reqSem <- struct{}{}
 	store.sessions[sessionID] = sess
 	return sess
 }

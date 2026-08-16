@@ -247,6 +247,98 @@ func isMeaningfulGeminiFunctionCall(raw json.RawMessage) bool {
 	return nonEmptyJSONPayload(call.Args)
 }
 
+type geminiGroundingChunk struct {
+	Web *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+	} `json:"web"`
+	RetrievedContext *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+		Text  string `json:"text"`
+	} `json:"retrievedContext"`
+}
+
+type geminiGroundingMetadata struct {
+	WebSearchQueries []string               `json:"webSearchQueries"`
+	GroundingChunks  []geminiGroundingChunk `json:"groundingChunks"`
+	SearchEntryPoint *struct {
+		RenderedContent string `json:"renderedContent"`
+	} `json:"searchEntryPoint"`
+	RetrievalQueries []string `json:"retrievalQueries"`
+}
+
+func hasMeaningfulGroundingMetadata(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+		return false
+	}
+	var meta geminiGroundingMetadata
+	if err := json.Unmarshal(trimmed, &meta); err == nil {
+		for _, q := range meta.WebSearchQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, q := range meta.RetrievalQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, chunk := range meta.GroundingChunks {
+			if chunk.Web != nil {
+				if strings.TrimSpace(chunk.Web.URI) != "" || strings.TrimSpace(chunk.Web.Title) != "" {
+					return true
+				}
+			}
+			if chunk.RetrievedContext != nil {
+				if strings.TrimSpace(chunk.RetrievedContext.URI) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Title) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Text) != "" {
+					return true
+				}
+			}
+		}
+		if meta.SearchEntryPoint != nil && strings.TrimSpace(meta.SearchEntryPoint.RenderedContent) != "" {
+			return true
+		}
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(trimmed, &generic); err == nil {
+		for k, v := range generic {
+			if k == "groundingChunks" || k == "webSearchQueries" || k == "retrievalQueries" || k == "searchEntryPoint" {
+				continue
+			}
+			switch val := v.(type) {
+			case nil:
+			case string:
+				if strings.TrimSpace(val) != "" {
+					return true
+				}
+			case map[string]any:
+				if len(val) > 0 {
+					for _, mv := range val {
+						if s, ok := mv.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			case []any:
+				if len(val) > 0 {
+					for _, ev := range val {
+						if s, ok := ev.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isMeaningfulToolCall(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -345,7 +437,8 @@ type geminiCandidate struct {
 	Content *struct {
 		Parts []geminiPart `json:"parts"`
 	} `json:"content"`
-	FinishReason *string `json:"finishReason"`
+	FinishReason      *string         `json:"finishReason"`
+	GroundingMetadata json.RawMessage `json:"groundingMetadata"`
 }
 
 type geminiUsageMetadata struct {
@@ -357,13 +450,15 @@ type geminiPromptFeedback struct {
 }
 
 type geminiChunk struct {
-	Candidates     []geminiCandidate     `json:"candidates"`
-	UsageMetadata  *geminiUsageMetadata  `json:"usageMetadata"`
-	PromptFeedback *geminiPromptFeedback `json:"promptFeedback"`
-	Response       *struct {
-		Candidates     []geminiCandidate     `json:"candidates"`
-		UsageMetadata  *geminiUsageMetadata  `json:"usageMetadata"`
-		PromptFeedback *geminiPromptFeedback `json:"promptFeedback"`
+	Candidates        []geminiCandidate     `json:"candidates"`
+	UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+	PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+	GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
+	Response          *struct {
+		Candidates        []geminiCandidate     `json:"candidates"`
+		UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+		PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+		GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
 	} `json:"response"`
 }
 
@@ -1061,6 +1156,12 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 			a.addUsage(*usage.CandidatesTokenCount)
 		}
 	}
+	if hasMeaningfulGroundingMetadata(chunk.GroundingMetadata) {
+		a.hasContent = true
+	}
+	if chunk.Response != nil && hasMeaningfulGroundingMetadata(chunk.Response.GroundingMetadata) {
+		a.hasContent = true
+	}
 
 	if a.geminiCandidatesSeen == nil {
 		a.geminiCandidatesSeen = make(map[int]bool)
@@ -1089,6 +1190,9 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 					a.terminal = true
 				}
 			}
+		}
+		if hasMeaningfulGroundingMetadata(cand.GroundingMetadata) {
+			a.hasContent = true
 		}
 		if cand.Content != nil {
 			for _, part := range cand.Content.Parts {

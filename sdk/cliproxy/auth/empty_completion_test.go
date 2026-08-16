@@ -3624,3 +3624,104 @@ func TestResponsesAnnotationsOutputItemAndContentPart(t *testing.T) {
 		}
 	})
 }
+
+func TestGeminiGroundingMetadata(t *testing.T) {
+	groundingChunkStopPayload := []byte(`{"candidates":[{"index":0,"finishReason":"STOP","groundingMetadata":{"groundingChunks":[{"web":{"uri":"https://example.com/weather","title":"Beijing Weather"}}]}}]}`)
+	emptyGroundingMetaPayload := []byte(`{"candidates":[{"index":0,"finishReason":"STOP","groundingMetadata":{}}]}`)
+	emptyGroundingChunksPayload := []byte(`{"candidates":[{"index":0,"finishReason":"STOP","groundingMetadata":{"groundingChunks":[{}]}}]}`)
+	normalContentPayload := []byte(`{"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[{"text":"hello"}]}}]}`)
+
+	t.Run("candidate STOP with no content but meaningful groundingChunks is not terminal-empty and is forwarded", func(t *testing.T) {
+		if IsEmptyCompletionPayload(groundingChunkStopPayload) {
+			t.Fatal("IsEmptyCompletionPayload(groundingChunkStopPayload) = true, want false")
+		}
+
+		var detector StreamBootstrapDetector
+		ssePayload := []byte("data: " + string(groundingChunkStopPayload) + "\n\n")
+		if !detector.Observe(ssePayload) {
+			t.Fatal("detector.Observe(ssePayload) = false for meaningful grounding chunks, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for meaningful grounding chunks, want true")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("detector.IsTerminalEmpty() = true for meaningful grounding chunks, want false")
+		}
+	})
+
+	t.Run("groundingMetadata empty object remains terminal-empty-eligible", func(t *testing.T) {
+		if !IsEmptyCompletionPayload(emptyGroundingMetaPayload) {
+			t.Fatal("IsEmptyCompletionPayload(emptyGroundingMetaPayload) = false, want true")
+		}
+
+		var detector StreamBootstrapDetector
+		ssePayload := []byte("data: " + string(emptyGroundingMetaPayload) + "\n\n")
+		if detector.Observe(ssePayload) {
+			t.Fatal("detector.Observe(ssePayload) = true for empty grounding metadata, want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for empty grounding metadata, want false")
+		}
+		if !detector.IsTerminalEmpty() {
+			t.Fatal("detector.IsTerminalEmpty() = false for empty grounding metadata at STOP, want true")
+		}
+	})
+
+	t.Run("groundingMetadata with empty chunk objects remains terminal-empty-eligible", func(t *testing.T) {
+		if !IsEmptyCompletionPayload(emptyGroundingChunksPayload) {
+			t.Fatal("IsEmptyCompletionPayload(emptyGroundingChunksPayload) = false, want true")
+		}
+
+		var detector StreamBootstrapDetector
+		ssePayload := []byte("data: " + string(emptyGroundingChunksPayload) + "\n\n")
+		if detector.Observe(ssePayload) {
+			t.Fatal("detector.Observe(ssePayload) = true for empty chunk objects, want false")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = true for empty chunk objects, want false")
+		}
+		if !detector.IsTerminalEmpty() {
+			t.Fatal("detector.IsTerminalEmpty() = false for empty chunk objects at STOP, want true")
+		}
+	})
+
+	t.Run("normal content path unaffected", func(t *testing.T) {
+		if IsEmptyCompletionPayload(normalContentPayload) {
+			t.Fatal("IsEmptyCompletionPayload(normalContentPayload) = true, want false")
+		}
+
+		var detector StreamBootstrapDetector
+		ssePayload := []byte("data: " + string(normalContentPayload) + "\n\n")
+		if !detector.Observe(ssePayload) {
+			t.Fatal("detector.Observe(ssePayload) = false for normal content, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false for normal content, want true")
+		}
+	})
+
+	t.Run("grounding-only with multi-candidate gating marks finished properly", func(t *testing.T) {
+		multiChunk1 := []byte("data: {\"candidates\":[{\"index\":0,\"finishReason\":\"STOP\",\"groundingMetadata\":{\"groundingChunks\":[{\"web\":{\"uri\":\"https://example.com\",\"title\":\"Example\"}}]}}]}\n\n")
+		multiChunk2 := []byte("data: {\"candidates\":[{\"index\":1,\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"second candidate text\"}]}}]}\n\n")
+
+		var detector StreamBootstrapDetector
+		detector.SetExpectedChoices(2)
+
+		if !detector.Observe(multiChunk1) {
+			t.Fatal("detector.Observe(multiChunk1) = false for candidate 0 with grounding, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("detector.HasMeaningfulOutput() = false after candidate 0 with grounding, want true")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("detector.IsTerminalEmpty() = true while awaiting candidate 1, want false")
+		}
+
+		if !detector.Observe(multiChunk2) {
+			t.Fatal("detector.Observe(multiChunk2) = false for candidate 1, want true")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("detector.IsTerminalEmpty() = true after both candidates finished, want false")
+		}
+	})
+}

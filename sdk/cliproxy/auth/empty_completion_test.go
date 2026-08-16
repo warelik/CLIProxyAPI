@@ -3402,3 +3402,69 @@ func TestGeminiStreamBootstrapMultiCandidate(t *testing.T) {
 		}
 	})
 }
+
+func TestResponsesReasoningSummaryPartScaffoldDoesNotPrematurelyForward(t *testing.T) {
+	t.Run("empty reasoning_summary_part.added does not forward and preserves buffer for upstream error", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		scaffoldEvent := []byte("data: {\"type\":\"response.reasoning_summary_part.added\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n")
+
+		if detector.Observe(scaffoldEvent) {
+			t.Fatal("Observe(empty reasoning_summary_part.added) = true, want false (must not prematurely forward)")
+		}
+		if detector.HasMeaningfulOutput() {
+			t.Fatal("HasMeaningfulOutput() = true on empty scaffold, want false")
+		}
+		if detector.IsTerminalEmpty() {
+			t.Fatal("IsTerminalEmpty() = true on scaffold, want false")
+		}
+
+		// Conductor stream test: when upstream error arrives after empty scaffold,
+		// readStreamBootstrap surfaces the upstream error instead of committing success.
+		ch := make(chan cliproxyexecutor.StreamChunk, 2)
+		ch <- cliproxyexecutor.StreamChunk{Payload: scaffoldEvent}
+		ch <- cliproxyexecutor.StreamChunk{Err: errors.New("upstream connection reset")}
+
+		buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+		if err == nil || !strings.Contains(err.Error(), "upstream connection reset") {
+			t.Fatalf("readStreamBootstrap error = %v, want upstream connection reset", err)
+		}
+		if closed {
+			t.Fatal("readStreamBootstrap closed = true, want false")
+		}
+		if len(buffered) != 0 {
+			t.Fatalf("len(buffered) = %d, want 0 on pre-output error", len(buffered))
+		}
+	})
+
+	t.Run("reasoning_summary_text.delta with meaningful text forwards stream", func(t *testing.T) {
+		var detector StreamBootstrapDetector
+		scaffoldEvent := []byte("data: {\"type\":\"response.reasoning_summary_part.added\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n")
+		deltaEvent := []byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"thinking step 1\"}\n\n")
+
+		if detector.Observe(scaffoldEvent) {
+			t.Fatal("Observe(scaffoldEvent) = true, want false")
+		}
+		if !detector.Observe(deltaEvent) {
+			t.Fatal("Observe(deltaEvent with text) = false, want true")
+		}
+		if !detector.HasMeaningfulOutput() {
+			t.Fatal("HasMeaningfulOutput() = false after delta with text, want true")
+		}
+	})
+}
+
+func TestNonStreamMessageReasoningField(t *testing.T) {
+	t.Run("non-stream response with message.reasoning is not empty completion", func(t *testing.T) {
+		payload := []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":12345,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning":"let me think about this"},"finish_reason":"stop"}]}`)
+		if IsEmptyCompletionPayload(payload) {
+			t.Fatal("IsEmptyCompletionPayload(reasoning payload) = true, want false")
+		}
+	})
+
+	t.Run("non-stream response with empty message.reasoning is empty completion", func(t *testing.T) {
+		payload := []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":12345,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning":""},"finish_reason":"stop"}]}`)
+		if !IsEmptyCompletionPayload(payload) {
+			t.Fatal("IsEmptyCompletionPayload(empty reasoning payload) = false, want true")
+		}
+	})
+}

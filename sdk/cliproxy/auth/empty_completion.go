@@ -82,6 +82,7 @@ type openAIChunk struct {
 		Delta struct {
 			Content          string            `json:"content"`
 			ReasoningContent string            `json:"reasoning_content"`
+			Reasoning        string            `json:"reasoning"`
 			Refusal          *string           `json:"refusal"`
 			ToolCalls        []json.RawMessage `json:"tool_calls"`
 			FunctionCall     json.RawMessage   `json:"function_call"`
@@ -91,6 +92,7 @@ type openAIChunk struct {
 		Message struct {
 			Content          string            `json:"content"`
 			ReasoningContent string            `json:"reasoning_content"`
+			Reasoning        string            `json:"reasoning"`
 			Refusal          *string           `json:"refusal"`
 			ToolCalls        []json.RawMessage `json:"tool_calls"`
 			FunctionCall     json.RawMessage   `json:"function_call"`
@@ -397,12 +399,19 @@ type openAIResponseObject struct {
 	Usage  *openAIResponseUsage `json:"usage"`
 }
 
+type openAIResponsePart struct {
+	Type             string `json:"type"`
+	Text             string `json:"text"`
+	EncryptedContent string `json:"encrypted_content"`
+}
+
 type openAIResponseChunk struct {
 	Type      string                `json:"type"`
 	Object    string                `json:"object"`
 	Status    string                `json:"status"`
 	Output    json.RawMessage       `json:"output"`
 	Item      json.RawMessage       `json:"item"`
+	Part      json.RawMessage       `json:"part"`
 	Usage     *openAIResponseUsage  `json:"usage"`
 	Response  *openAIResponseObject `json:"response"`
 	Delta     string                `json:"delta"`
@@ -421,8 +430,16 @@ var openAIResponseEventTypes = map[string]bool{
 	"response.failed":                        true,
 	"response.output_item.added":             true,
 	"response.output_item.done":              true,
+	"response.content_part.added":            true,
+	"response.content_part.done":             true,
 	"response.output_text.delta":             true,
 	"response.output_text.done":              true,
+	"response.reasoning_summary_part.added":  true,
+	"response.reasoning_summary_part.done":   true,
+	"response.reasoning_summary_text.delta":  true,
+	"response.reasoning_summary_text.done":   true,
+	"response.reasoning_text.delta":          true,
+	"response.reasoning_text.done":           true,
 	"response.function_call_arguments.delta": true,
 	"response.function_call_arguments.done":  true,
 	"error":                                  true,
@@ -536,7 +553,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 				a.terminal = true
 			}
 		}
-		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent
+		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent + ch.Delta.Reasoning + ch.Message.Reasoning
 		if strings.TrimSpace(content) != "" {
 			a.hasContent = true
 		}
@@ -734,13 +751,20 @@ func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
 	}
 
 	switch evType {
-	case "response.output_text.delta":
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if strings.TrimSpace(chunk.Delta) != "" {
 			a.hasContent = true
 		}
-	case "response.output_text.done":
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
 		if strings.TrimSpace(chunk.Text) != "" {
 			a.hasContent = true
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.content_part.added", "response.content_part.done":
+		var part openAIResponsePart
+		if err := json.Unmarshal(chunk.Part, &part); err == nil {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" {
+				a.hasContent = true
+			}
 		}
 	case "response.output_item.done":
 		var item openAIResponseOutputItem

@@ -802,10 +802,9 @@ var (
 	// responsesStreamAuthPattern redacts standalone Bearer/Basic credentials
 	// that appear outside key/value contexts (e.g. embedded in event names).
 	responsesStreamAuthPattern = regexp.MustCompile(`(?i)(\b(?:Bearer|Basic)\s+)([-A-Za-z0-9._~+/=]+)`)
-	// responsesStreamAuthDenyWords marks prose words that follow Bearer/Basic in
-	// natural English ("bearer of bad news", "the bearer to the manager") so
-	// prose is not misclassified as a standalone credential.
-	responsesStreamAuthDenyWords = regexp.MustCompile(`(?i)^(?:of|to|in|is|and|the|for|from|with|by|at|or)$`)
+	// responsesStreamProseFollowPattern detects when a lowercase scheme is
+	// followed by natural prose words ("bearer of bad news", "the bearer to the manager").
+	responsesStreamProseFollowPattern = regexp.MustCompile(`^\s+[a-z]+`)
 )
 
 func truncateResponsesStreamErrorText(text string, limit int) string {
@@ -818,16 +817,33 @@ func truncateResponsesStreamErrorText(text string, limit int) string {
 
 func redactResponsesStreamErrorText(text string) string {
 	text = redactResponsesStreamKeyValues(text)
-	return responsesStreamAuthPattern.ReplaceAllStringFunc(text, func(m string) string {
-		sub := responsesStreamAuthPattern.FindStringSubmatch(m)
-		if len(sub) < 3 {
-			return m
+	locs := responsesStreamAuthPattern.FindAllStringSubmatchIndex(text, -1)
+	if len(locs) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	last := 0
+	for _, loc := range locs {
+		matchStart, matchEnd := loc[0], loc[1]
+		if matchStart < last {
+			continue
 		}
-		if responsesStreamAuthDenyWords.MatchString(sub[2]) {
-			return m
+		scheme := text[loc[2]:loc[3]]
+		tail := text[matchEnd:]
+		// Prose check: lowercase scheme ("bearer", "basic") followed by space + lowercase prose words
+		if scheme[0] >= 'a' && scheme[0] <= 'z' && responsesStreamProseFollowPattern.MatchString(tail) {
+			b.WriteString(text[last:matchEnd])
+			last = matchEnd
+			continue
 		}
-		return sub[1] + "[REDACTED]"
-	})
+		b.WriteString(text[last:loc[2]])
+		b.WriteString(scheme)
+		b.WriteString("[REDACTED]")
+		last = matchEnd
+	}
+	b.WriteString(text[last:])
+	return b.String()
 }
 
 // redactResponsesStreamKeyValues locates sensitive key/value pairs and replaces

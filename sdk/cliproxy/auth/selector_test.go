@@ -2865,3 +2865,19 @@ func TestSessionAffinitySelector_RequestScopedExclusionBreaksCarousel(t *testing
 		}
 	}
 }
+
+func TestSessionAffinitySelector_QuarantineCleanupCadence(t *testing.T) {
+	selector := NewSessionAffinitySelector(nil)
+	if selector.quarantine == nil {
+		t.Fatal("selector.quarantine is nil")
+	}
+	if selector.cache == nil {
+		t.Fatal("selector.cache is nil")
+	}
+	if selector.cache.ttl != time.Hour {
+		t.Fatalf("selector.cache.ttl = %v, want 1h", selector.cache.ttl)
+	}
+	if selector.quarantine.ttl > 5*time.Second {
+		t.Fatalf("selector.quarantine.ttl = %v, want <= 5s to decouple cleanup cadence from 1h affinity TTL", selector.quarantine.ttl)
+	}
+}

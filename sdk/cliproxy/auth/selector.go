@@ -655,10 +655,14 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	quarantineTTL := 5 * time.Second
+	if cfg.TTL > 0 && cfg.TTL < quarantineTTL {
+		quarantineTTL = cfg.TTL
+	}
 	return &SessionAffinitySelector{
 		fallback:   cfg.Fallback,
 		cache:      NewSessionCache(cfg.TTL),
-		quarantine: NewSessionCache(cfg.TTL),
+		quarantine: NewSessionCache(quarantineTTL),
 	}
 }
 

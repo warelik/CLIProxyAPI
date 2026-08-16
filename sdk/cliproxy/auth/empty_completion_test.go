@@ -3266,4 +3266,53 @@ func TestEmptyCompletion_OpenAIFinishReasonStopWithoutDoneIsTerminalEmpty(t *tes
 	if detectorMulti.IsTerminalEmpty() {
 		t.Fatal("IsTerminalEmpty() = true after content received, want false")
 	}
+
+	// Case 5 (Round 40): Multi-choice (n=2) stream where the first received frame
+	// is choice 0 finish:"stop" empty and choice 1 has not appeared yet.
+	// Must NOT trigger IsTerminalEmpty() early.
+	var detectorMultiEarly StreamBootstrapDetector
+	detectorMultiEarly.SetExpectedChoices(2)
+	frameChoice0Finish := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	if detectorMultiEarly.Observe(frameChoice0Finish) {
+		t.Fatal("Observe(frameChoice0Finish) = true, want false")
+	}
+	if detectorMultiEarly.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = true on first frame when expected n=2, want false until all n choices finish")
+	}
+
+	// Case 6 (Round 40): Multi-choice (n=2) stream where all n choices finish empty.
+	frameChoice1Finish := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	if detectorMultiEarly.Observe(frameChoice1Finish) {
+		t.Fatal("Observe(frameChoice1Finish) = true, want false")
+	}
+	if !detectorMultiEarly.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = false when all n=2 choices finished empty, want true")
+	}
+}
+
+func TestExtractExpectedChoices(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    int
+	}{
+		{name: "nil payload", payload: "", want: 1},
+		{name: "empty json", payload: `{}`, want: 1},
+		{name: "explicit n=1", payload: `{"n":1}`, want: 1},
+		{name: "explicit n=2", payload: `{"model":"gpt-4o","n":2}`, want: 2},
+		{name: "explicit n=4", payload: `{"n":4,"prompt":"hello"}`, want: 4},
+		{name: "nested request.n=3", payload: `{"request":{"n":3}}`, want: 3},
+		{name: "invalid n=0", payload: `{"n":0}`, want: 1},
+		{name: "negative n=-1", payload: `{"n":-1}`, want: 1},
+		{name: "invalid json", payload: `not json`, want: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ExtractExpectedChoices([]byte(tc.payload))
+			if got != tc.want {
+				t.Fatalf("ExtractExpectedChoices(%q) = %d, want %d", tc.payload, got, tc.want)
+			}
+		})
+	}
 }

@@ -108,7 +108,7 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 	if err != nil {
 		return nil, err
 	}
-	return wrapStreamEmptyCompletion(ctx, streamResult), nil
+	return wrapStreamEmptyCompletion(ctx, streamResult, req.Payload, opts.OriginalRequest), nil
 }
 
 // wrapStreamEmptyCompletion wraps a plugin stream so that a terminal but empty
@@ -116,7 +116,7 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 // instead of a clean stream end, mirroring the conductor's aggregate-at-close
 // judgment. Recognized protocol framing is buffered only until meaningful output
 // appears or the stream closes; unrecognized streams remain pass-through.
-func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.StreamResult) *coreexecutor.StreamResult {
+func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.StreamResult, requestPayloads ...[]byte) *coreexecutor.StreamResult {
 	if streamResult == nil || streamResult.Chunks == nil {
 		return streamResult
 	}
@@ -129,6 +129,12 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 		defer close(wrapped)
 		buffered := make([]coreexecutor.StreamChunk, 0, 1)
 		var detector coreauth.StreamBootstrapDetector
+		for _, p := range requestPayloads {
+			if n := coreauth.ExtractExpectedChoices(p); n > 1 {
+				detector.SetExpectedChoices(n)
+				break
+			}
+		}
 		forwarding := false
 		forward := func(chunk coreexecutor.StreamChunk) bool {
 			select {

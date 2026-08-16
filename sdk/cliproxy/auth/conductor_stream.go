@@ -126,12 +126,18 @@ func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cl
 	return result, nil
 }
 
-func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, requestPayloads ...[]byte) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
 	var bootstrap streamBootstrapState
+	for _, p := range requestPayloads {
+		if n := ExtractExpectedChoices(p); n > 1 {
+			bootstrap.setExpectedChoices(n)
+			break
+		}
+	}
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -426,7 +432,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		stopTTFT()
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks)
+		buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, streamResult.Chunks, execReq.Payload, execOpts.OriginalRequest)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				stopTTFT()
@@ -474,7 +480,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
-						buffered, closed, bootstrapErr = readStreamBootstrap(attemptCtx, streamResult.Chunks)
+						buffered, closed, bootstrapErr = readStreamBootstrap(attemptCtx, streamResult.Chunks, execReq.Payload, execOpts.OriginalRequest)
 						bootstrapErr = checkTTFTErr(bootstrapErr)
 					}
 				}

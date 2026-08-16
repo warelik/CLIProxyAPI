@@ -430,6 +430,7 @@ var openAIResponseEventTypes = map[string]bool{
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
 // an OpenAI-, Claude-, or Gemini-style completion is empty.
 type emptyCompletionAccum struct {
+	expectedChoices       int
 	recognized            bool
 	sawUnknownData        bool
 	terminal              bool
@@ -553,7 +554,15 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 			a.hasContent = true
 		}
 	}
-	if len(a.openAIChoicesSeen) > 0 && len(a.openAIChoicesFinished) == len(a.openAIChoicesSeen) && !a.blocked {
+	expected := a.expectedChoices
+	if expected <= 0 {
+		expected = 1
+	}
+	targetChoices := expected
+	if len(a.openAIChoicesSeen) > targetChoices {
+		targetChoices = len(a.openAIChoicesSeen)
+	}
+	if len(a.openAIChoicesFinished) >= targetChoices && len(a.openAIChoicesFinished) >= len(a.openAIChoicesSeen) && !a.blocked {
 		a.openAITerminal = true
 	} else {
 		a.openAITerminal = false
@@ -1221,6 +1230,13 @@ func (s *streamBootstrapState) isEmptyCompletion() bool {
 
 func (s *streamBootstrapState) isTerminalEmpty() bool {
 	return (s.sawDone || s.acc.geminiTerminal || s.acc.claudeTerminal || s.acc.openAITerminal) && s.acc.empty()
+}
+
+func (s *streamBootstrapState) setExpectedChoices(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	s.acc.expectedChoices = n
 }
 
 func (s *streamBootstrapState) hasMeaningfulOutput() bool {

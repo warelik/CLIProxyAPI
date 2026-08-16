@@ -64,3 +64,54 @@ func TestWrapStreamEmptyCompletionDetectsSplitUsageOnlyStream(t *testing.T) {
 		t.Fatalf("first payload = %q, want no client-visible bytes before error", first.Payload)
 	}
 }
+
+// TestWrapStreamEmptyCompletionMultiChoiceWithholdsTerminalUntilAllChoicesFinish
+// verifies that when n=2 is requested, an early terminal chunk for choice 0
+// does not cause an immediate empty_completion error if choice 1 subsequently emits content.
+func TestWrapStreamEmptyCompletionMultiChoiceForwardsContentWhenChoice1HasContent(t *testing.T) {
+	src := make(chan coreexecutor.StreamChunk, 3)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"hello\"}}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: [DONE]\n\n")}
+	close(src)
+
+	reqPayload := []byte(`{"model":"gpt-4o","n":2,"messages":[{"role":"user","content":"hi"}]}`)
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src}, reqPayload)
+
+	first, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped stream closed prematurely")
+	}
+	if first.Err != nil {
+		t.Fatalf("unexpected error on first chunk: %v", first.Err)
+	}
+	second, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped stream missing second chunk")
+	}
+	if string(second.Payload) != "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"hello\"}}]}\n\n" {
+		t.Fatalf("second payload = %q, want choice 1 content", second.Payload)
+	}
+}
+
+// TestWrapStreamEmptyCompletionMultiChoiceDetectsEmptyWhenAllChoicesFinishEmpty
+// verifies that when n=2 is requested and both choices finish empty,
+// wrapStreamEmptyCompletion correctly detects empty completion.
+func TestWrapStreamEmptyCompletionMultiChoiceDetectsEmptyWhenAllChoicesFinishEmpty(t *testing.T) {
+	src := make(chan coreexecutor.StreamChunk, 2)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")}
+	close(src)
+
+	reqPayload := []byte(`{"model":"gpt-4o","n":2,"messages":[{"role":"user","content":"hi"}]}`)
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src}, reqPayload)
+
+	first, ok := <-wrapped.Chunks
+	if !ok {
+		t.Fatal("wrapped multi-choice empty stream closed without empty_completion error")
+	}
+	var authErr *coreauth.Error
+	if !errors.As(first.Err, &authErr) || authErr.Code != "empty_completion" {
+		t.Fatalf("first error = %v, want empty_completion", first.Err)
+	}
+}

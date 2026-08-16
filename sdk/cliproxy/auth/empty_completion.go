@@ -425,6 +425,7 @@ type emptyCompletionAccum struct {
 	blocked          bool
 	sawMetadataOnly  bool
 	sawMessageData   bool
+	geminiTerminal   bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -870,6 +871,9 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 			a.sawMessageData = true
 			a.terminal = true
 			a.blocked = promptBlocked
+			if !promptBlocked {
+				a.geminiTerminal = true
+			}
 			if usage != nil && usage.CandidatesTokenCount != nil {
 				a.sawUsage = true
 				a.addUsage(*usage.CandidatesTokenCount)
@@ -935,6 +939,9 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 
 	if allTerminal {
 		a.terminal = true
+		if !blocked {
+			a.geminiTerminal = true
+		}
 	}
 	if blocked {
 		a.blocked = true
@@ -1163,7 +1170,7 @@ func (s *streamBootstrapState) isEmptyCompletion() bool {
 }
 
 func (s *streamBootstrapState) isTerminalEmpty() bool {
-	return s.sawDone && s.acc.empty()
+	return (s.sawDone || s.acc.geminiTerminal) && s.acc.empty()
 }
 
 func (s *streamBootstrapState) hasMeaningfulOutput() bool {

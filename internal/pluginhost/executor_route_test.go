@@ -31,7 +31,7 @@ func TestWrapStreamEmptyCompletion_NormalEmptyStream(t *testing.T) {
 func TestWrapStreamEmptyCompletion_ErrChunkSkipsEmptyEval(t *testing.T) {
 	expectedErr := errors.New("upstream connection reset")
 	chunks := make(chan coreexecutor.StreamChunk, 2)
-	chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")}
+	chunks <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n")}
 	chunks <- coreexecutor.StreamChunk{Err: expectedErr}
 	close(chunks)
 

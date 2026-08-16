@@ -3210,3 +3210,38 @@ func TestEmptyCompletion_OpenAIImageGenerationResult(t *testing.T) {
 		t.Fatalf("StreamBootstrapDetector.Observe(whitespace result) = %v, want false", got)
 	}
 }
+
+func TestEmptyCompletion_OpenAIFinishReasonStopWithoutDoneIsTerminalEmpty(t *testing.T) {
+	// Case 1: Single choice finish_reason="stop" without [DONE] is terminal empty.
+	var detector StreamBootstrapDetector
+	stopChunk := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	got := detector.Observe(stopChunk)
+	if got {
+		t.Fatalf("Observe(stopChunk) = %v, want false", got)
+	}
+	if !detector.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = false, want true for OpenAI finish_reason:stop without [DONE]")
+	}
+
+	// Case 2: Multi-choice with partial finish_reason (choice 0 "stop", choice 1 nil) is NOT terminal yet.
+	var detectorPartial StreamBootstrapDetector
+	partialChunk := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{}}]}\n\n")
+	gotPartial := detectorPartial.Observe(partialChunk)
+	if gotPartial {
+		t.Fatalf("Observe(partialChunk) = %v, want false", gotPartial)
+	}
+	if detectorPartial.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = true, want false when not all choices have finish_reason")
+	}
+
+	// Case 3: Non-stop reason (content_filter) is NOT empty completion and forwards.
+	var detectorFilter StreamBootstrapDetector
+	filterChunk := []byte("data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n")
+	gotFilter := detectorFilter.Observe(filterChunk)
+	if !gotFilter {
+		t.Fatalf("Observe(filterChunk) = %v, want true for blocked reason", gotFilter)
+	}
+	if detectorFilter.IsTerminalEmpty() {
+		t.Fatal("IsTerminalEmpty() = true, want false for content_filter")
+	}
+}

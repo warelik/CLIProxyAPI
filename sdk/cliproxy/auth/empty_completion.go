@@ -441,6 +441,7 @@ type emptyCompletionAccum struct {
 	sawMessageData   bool
 	geminiTerminal   bool
 	claudeTerminal   bool
+	openAITerminal   bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -505,6 +506,7 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		a.sawUsage = true
 		a.addUsage(*chunk.Usage.CompletionTokens)
 	}
+	allTerminal := len(chunk.Choices) > 0
 	for _, ch := range chunk.Choices {
 		if ch.FinishReason != nil {
 			reason := strings.TrimSpace(*ch.FinishReason)
@@ -516,7 +518,11 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 				// rather than a silent auth rotation.
 				a.blocked = true
 				a.terminal = true
+			} else {
+				allTerminal = false
 			}
+		} else {
+			allTerminal = false
 		}
 		content := ch.Text + ch.Delta.Content + ch.Message.Content + ch.Delta.ReasoningContent + ch.Message.ReasoningContent
 		if strings.TrimSpace(content) != "" {
@@ -538,6 +544,9 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		if hasMeaningfulImages(ch.Delta.Images) || hasMeaningfulImages(ch.Message.Images) {
 			a.hasContent = true
 		}
+	}
+	if allTerminal && !a.blocked {
+		a.openAITerminal = true
 	}
 	if len(chunk.Choices) == 0 && chunk.Usage != nil {
 		// A completed non-streaming payload with zero choices
@@ -1201,7 +1210,7 @@ func (s *streamBootstrapState) isEmptyCompletion() bool {
 }
 
 func (s *streamBootstrapState) isTerminalEmpty() bool {
-	return (s.sawDone || s.acc.geminiTerminal || s.acc.claudeTerminal) && s.acc.empty()
+	return (s.sawDone || s.acc.geminiTerminal || s.acc.claudeTerminal || s.acc.openAITerminal) && s.acc.empty()
 }
 
 func (s *streamBootstrapState) hasMeaningfulOutput() bool {

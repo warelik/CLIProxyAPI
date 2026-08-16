@@ -23,6 +23,14 @@ import (
 var quotaCooldownDisabled atomic.Bool
 
 var transientErrorCooldownSeconds atomic.Int64
+var resumableCooldownReasons = []string{
+	"invalid_api_key",
+	"invalid_grant",
+	"unauthorized",
+	"payment_required",
+	"not_found",
+	"quota",
+}
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -947,12 +955,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if shouldResumeModel {
 		for _, m := range modelsForRegisteredAuth(result.AuthID) {
-			if registry.GetGlobalRegistry().GetClientModelSuspensionReason(result.AuthID, m) == "invalid_api_key" {
-				registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, m)
-			}
+			registry.GetGlobalRegistry().ResumeClientModelIfReason(result.AuthID, m, resumableCooldownReasons...)
 		}
 		if modelKey != "" {
-			registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, modelKey)
+			registry.GetGlobalRegistry().ResumeClientModelIfReason(result.AuthID, modelKey, resumableCooldownReasons...)
 		}
 	} else if shouldSuspendModel {
 		if suspendReason == "invalid_api_key" {

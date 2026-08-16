@@ -793,6 +793,46 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
 }
 
+// ResumeClientModelIfReason atomically verifies that clientID is suspended for modelID with one
+// of the given reason(s) and, only if so, resumes it (removing the suspension) under a single
+// lock. It reports whether a resume happened. This avoids the TOCTOU of a separate
+// GetClientModelSuspensionReason check followed by ResumeClientModel racing with a newer
+// suspension recorded between the two.
+func (r *ModelRegistry) ResumeClientModelIfReason(clientID, modelID string, resumableReasons ...string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.ensureAvailableModelsCacheLocked()
+
+	registration, exists := r.models[modelID]
+	if !exists || registration == nil || registration.SuspendedClients == nil {
+		return false
+	}
+	reason, suspended := registration.SuspendedClients[clientID]
+	if !suspended {
+		return false
+	}
+	resumable := false
+	for _, rr := range resumableReasons {
+		if reason == rr {
+			resumable = true
+			break
+		}
+	}
+	if !resumable {
+		return false
+	}
+	delete(registration.SuspendedClients, clientID)
+	registration.LastUpdated = time.Now()
+	r.invalidateAvailableModelsCacheLocked()
+	log.Debugf("Resumed client %s for model %s (reason %s)", clientID, modelID, reason)
+	return true
+}
+
 // GetClientModelSuspensionReason returns the reason a client model was suspended, or empty string if not suspended.
 func (r *ModelRegistry) GetClientModelSuspensionReason(clientID, modelID string) string {
 	clientID = strings.TrimSpace(clientID)

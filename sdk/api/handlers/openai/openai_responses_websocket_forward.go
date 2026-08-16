@@ -546,10 +546,27 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 	// reach the downstream client. Raw upstream body and header bytes are never
 	// echoed.
 	if errText := responsesStreamErrorText(errMsg, status); json.Valid([]byte(errText)) {
-		node := gjson.Parse(errText).Get("error")
+		root := gjson.Parse(errText)
+		node := root.Get("error")
 		if node.Exists() && node.IsObject() {
 			payload, errSet = sjson.SetRawBytes(payload, "error", []byte(node.Raw))
 			return payload, errSet
+		}
+		if root.IsObject() {
+			errObj := []byte(`{}`)
+			copied := false
+			for _, field := range []string{"type", "code", "message", "param"} {
+				v := root.Get(field)
+				if !v.Exists() || v.Type == gjson.Null {
+					continue
+				}
+				errObj, _ = sjson.SetBytes(errObj, field, v.Value())
+				copied = true
+			}
+			if copied {
+				payload, errSet = sjson.SetRawBytes(payload, "error", errObj)
+				return payload, errSet
+			}
 		}
 		payload, errSet = sjson.SetBytes(payload, "error.message", truncateResponsesStreamErrorText(redactResponsesStreamErrorText(errText), responsesStreamErrorMessageLimit))
 		return payload, errSet

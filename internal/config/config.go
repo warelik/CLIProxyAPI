@@ -171,4 +171,7 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// Translator controls cross-format request translation behavior.
+	Translator TranslatorConfig `yaml:"translator" json:"translator"`
 }

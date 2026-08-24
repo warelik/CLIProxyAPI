@@ -639,3 +639,45 @@ func TestCompatibleAntigravityClaudeThinkingSignature_RejectsClaudeCAIS(t *testi
 		t.Fatalf("CompatibleAntigravityClaudeThinkingSignature(claude-cais#ClaudeCAIS) = %q, %v; want empty and false", normalized, ok)
 	}
 }
+
+// TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope is the replay-gate
+// contract: CAIS envelopes must be accepted through IsValidClaudeCAISSignature,
+// while classic E/R and garbage keep their existing answers.
+func TestHasDecodableClaudeThinkingSignature_AcceptsCAISEnvelope(t *testing.T) {
+	eSig := testClaudeThinkingSignature()
+	if eSig == "" || eSig[0] != 'E' {
+		t.Fatalf("testClaudeThinkingSignature() = %q, want non-empty E-prefix", eSig)
+	}
+	rSig := base64.StdEncoding.EncodeToString([]byte(eSig))
+	if rSig == "" || rSig[0] != 'R' {
+		t.Fatalf("R-form of classic signature = %q, want R-prefix", rSig)
+	}
+
+	cases := []struct {
+		name string
+		sig  string
+		want bool
+	}{
+		{"observed CAIS", observedFable5Sample, true},
+		{"CAIS with ccmax prefix", "ccmax#" + observedFable5Sample, true},
+		{"CAIS with claude prefix", "claude#" + observedFable5Sample, true},
+		{"generated opus-5 CAIS", testClaudeCAISSignature("claude-opus-5"), true},
+		{"E-prefix classic", eSig, true},
+		{"R-prefix classic", rSig, true},
+		{"E-prefix with cache prefix", "modelGroup#" + eSig, true},
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+		{"garbage", "not-a-signature", false},
+		{"CAIS-looking garbage", "CAIS!!!not-base64", false},
+		{"foreign GPT blob", "gAAAAABopenai-encrypted-content", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := HasDecodableClaudeThinkingSignature(tc.sig)
+			if got != tc.want {
+				t.Fatalf("HasDecodableClaudeThinkingSignature(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

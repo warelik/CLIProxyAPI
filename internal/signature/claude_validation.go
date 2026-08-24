@@ -131,7 +131,8 @@ type ClaudeSignatureValidationOptions struct {
 	PrefixOnly bool
 	// Base64Only checks the optional cache prefix, E/R Claude signature prefix,
 	// and base64 layers without validating the decoded Claude marker or protobuf
-	// tree. Use it for conservative request cleanup.
+	// tree. CAIS envelopes are accepted via IsValidClaudeCAISSignature. Use it
+	// for conservative request cleanup.
 	Base64Only bool
 	// AllowEmptySignatureWithEmptyText preserves empty thinking placeholders with
 	// no signature and no thinking/text payload during strip operations.
@@ -175,7 +176,8 @@ func IsValidClaudeThinkingSignature(rawSignature string, opts ...ClaudeSignature
 }
 
 // HasDecodableClaudeThinkingSignature reports whether rawSignature has the
-// Claude E/R shape and its expected base64 layer(s) can be decoded.
+// Claude E/R shape and its expected base64 layer(s) can be decoded, or is a
+// valid Claude CAIS envelope.
 func HasDecodableClaudeThinkingSignature(rawSignature string) bool {
 	sig := stripClaudeSignaturePrefix(rawSignature)
 	if sig == "" || len(sig) > MaxClaudeThinkingSignatureLen {
@@ -194,7 +196,7 @@ func HasDecodableClaudeThinkingSignature(rawSignature string) bool {
 		innerDecoded, err := base64.StdEncoding.DecodeString(string(decoded))
 		return err == nil && len(innerDecoded) > 0
 	default:
-		return false
+		return IsValidClaudeCAISSignature(rawSignature)
 	}
 }
 

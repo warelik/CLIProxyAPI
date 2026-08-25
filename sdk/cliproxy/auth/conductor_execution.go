@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1584,11 +1585,36 @@ func formatAuthIdentity(auth *Auth, provider string) string {
 	}
 }
 
+var (
+	// Vendor API-key prefixes used by providers this proxy talks to, plus the
+	// historical OpenAI sk- shape. A single extra prefix is not the class.
+	logSecretAPIKeyPattern = regexp.MustCompile(`(?i)\b(?:sk-[A-Za-z0-9_-]{8,}|xai-[A-Za-z0-9_-]{8,}|gsk_[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,}|r8_[A-Za-z0-9_-]{8,}|pplx-[A-Za-z0-9_-]{8,}|nvapi-[A-Za-z0-9_-]{8,}|hf_[A-Za-z0-9_-]{8,})`)
+	logSecretBearerPattern = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{4,}`)
+	// Labeled secrets: JSON (`"apiKey":`), `api-key:`, and prose
+	// (`Incorrect API key provided: <value>`). `[_-]?` does not accept a space,
+	// so `api[\s_-]*key` plus a short run of filler words before `=`/`:`.
+	logSecretLabeledPattern = regexp.MustCompile(`(?i)((?:"?(?:api[\s_-]*key|access[\s_-]*token|token|authorization|secret)"?(?:\s+\w+){0,4})\s*[=:]\s*"?)([^\s"&,;}]+)`)
+)
+
+func redactSecretsForLog(msg string) string {
+	msg = logSecretAPIKeyPattern.ReplaceAllString(msg, "[REDACTED]")
+	msg = logSecretBearerPattern.ReplaceAllString(msg, "$1 [REDACTED]")
+	msg = logSecretLabeledPattern.ReplaceAllString(msg, "${1}[REDACTED]")
+	return msg
+}
+
+func redactStreamPayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	return []byte(redactSecretsForLog(string(payload)))
+}
+
 func summarizeErrorForLog(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := strings.TrimSpace(err.Error())
+	msg := redactSecretsForLog(strings.TrimSpace(err.Error()))
 	const maxRunes = 300
 	runes := []rune(msg)
 	if len(runes) > maxRunes {

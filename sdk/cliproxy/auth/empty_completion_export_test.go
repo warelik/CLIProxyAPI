@@ -42,6 +42,19 @@ func TestStreamBootstrapDetectorNilReceiver(t *testing.T) {
 	if detector.IsTerminalEmpty() {
 		t.Fatal("nil IsTerminalEmpty() = true, want false")
 	}
+	if detector.StreamError() != nil {
+		t.Fatal("nil StreamError() != nil, want nil")
+	}
 	detector.SetExpectedChoices(2)
 	detector.SetRequestPayload([]byte(`{"n":4}`))
+}
+
+func TestStreamPayloadErrorDetectorNilReceiver(t *testing.T) {
+	var detector *StreamPayloadErrorDetector
+	if detector.Observe([]byte(`{"error":{"message":"x"}}`)) != nil {
+		t.Fatal("nil Observe() returned error")
+	}
+	if detector.Finish() != nil {
+		t.Fatal("nil Finish() returned error")
+	}
 }

@@ -265,9 +265,48 @@ func isMeaningfulToolCall(raw json.RawMessage) bool {
 	return false
 }
 
+type claudeContentBlock struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
+	Data      string          `json:"data"`
+	Input     json.RawMessage `json:"input"`
+	Citation  json.RawMessage `json:"citation"`
+}
+
+type claudeChunk struct {
+	Type       string               `json:"type"`
+	StopReason *string              `json:"stop_reason"`
+	Content    []claudeContentBlock `json:"content"`
+	Usage      *struct {
+		OutputTokens *tokenCount `json:"output_tokens"`
+	} `json:"usage"`
+	Message *struct {
+		Type       string               `json:"type"`
+		StopReason *string              `json:"stop_reason"`
+		Content    []claudeContentBlock `json:"content"`
+		Usage      *struct {
+			OutputTokens *tokenCount `json:"output_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+	ContentBlock *claudeContentBlock `json:"content_block"`
+	Delta        *struct {
+		Type        string          `json:"type"`
+		Text        string          `json:"text"`
+		Thinking    string          `json:"thinking"`
+		Signature   string          `json:"signature"`
+		Citation    json.RawMessage `json:"citation"`
+		PartialJSON string          `json:"partial_json"`
+		StopReason  *string         `json:"stop_reason"`
+	} `json:"delta"`
+}
+
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
-// an OpenAI-style completion is empty. Later slices add Claude/Gemini/Responses
-// evaluators onto the same accum; unused format flags are omitted here.
+// an OpenAI- or Claude-style completion is empty. Later slices add
+// Gemini/Responses evaluators onto the same accum.
 type emptyCompletionAccum struct {
 	expectedChoices       int
 	recognized            bool
@@ -281,6 +320,7 @@ type emptyCompletionAccum struct {
 	sawMetadataOnly       bool
 	sawMessageData        bool
 	openAITerminal        bool
+	claudeTerminal        bool
 	openAIChoicesSeen     map[int]bool
 	openAIChoicesFinished map[int]bool
 }
@@ -292,7 +332,7 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) {
+		if a.evalOpenAI(v) || a.evalClaude(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -414,6 +454,138 @@ func (a *emptyCompletionAccum) evalOpenAI(data []byte) bool {
 		a.terminal = true
 	}
 	return true
+}
+
+func (a *emptyCompletionAccum) evalClaude(data []byte) bool {
+	var chunk claudeChunk
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return false
+	}
+
+	isClaude := false
+	switch chunk.Type {
+	case "message", "message_start", "content_block_start", "content_block_delta", "message_delta", "message_stop", "ping":
+		isClaude = true
+	default:
+		if chunk.StopReason != nil || (chunk.Message != nil && (chunk.Message.Type == "message" || chunk.Message.StopReason != nil)) {
+			isClaude = true
+		}
+	}
+
+	if !isClaude {
+		return false
+	}
+
+	a.recognized = true
+	if chunk.Type == "ping" {
+		a.sawMetadataOnly = true
+	} else {
+		a.sawMessageData = true
+	}
+	if chunk.Type == "message_stop" {
+		a.terminal = true
+		a.claudeTerminal = true
+	}
+
+	a.evalClaudeStopReason(chunk.StopReason)
+	if chunk.Message != nil {
+		a.evalClaudeStopReason(chunk.Message.StopReason)
+	}
+	if chunk.Delta != nil {
+		a.evalClaudeStopReason(chunk.Delta.StopReason)
+	}
+
+	if chunk.Usage != nil && chunk.Usage.OutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*chunk.Usage.OutputTokens)
+	}
+	if chunk.Message != nil && chunk.Message.Usage != nil && chunk.Message.Usage.OutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*chunk.Message.Usage.OutputTokens)
+	}
+
+	a.evalClaudeBlocks(chunk.Content)
+	if chunk.Message != nil {
+		a.evalClaudeBlocks(chunk.Message.Content)
+	}
+	if chunk.ContentBlock != nil {
+		a.evalClaudeBlocks([]claudeContentBlock{*chunk.ContentBlock})
+	}
+	if chunk.Delta != nil {
+		switch chunk.Delta.Type {
+		case "text_delta":
+			if strings.TrimSpace(chunk.Delta.Text) != "" {
+				a.hasContent = true
+			}
+		case "thinking_delta":
+			if strings.TrimSpace(chunk.Delta.Thinking) != "" {
+				a.hasContent = true
+			}
+		case "signature_delta":
+			// A lonely signature is not visible content and does not spend
+			// completion tokens; do not treat it as a live completion.
+		case "citations_delta":
+			if nonEmptyJSONPayload(chunk.Delta.Citation) {
+				a.hasContent = true
+			}
+		case "input_json_delta":
+			if hasMeaningfulJSONArguments(chunk.Delta.PartialJSON) {
+				a.hasToolCalls = true
+			}
+		default:
+			if strings.TrimSpace(chunk.Delta.Text) != "" || strings.TrimSpace(chunk.Delta.Thinking) != "" || nonEmptyJSONPayload(chunk.Delta.Citation) {
+				a.hasContent = true
+			}
+		}
+	}
+
+	return true
+}
+
+func (a *emptyCompletionAccum) evalClaudeStopReason(stopReason *string) {
+	if stopReason == nil {
+		return
+	}
+	reason := strings.TrimSpace(*stopReason)
+	if strings.EqualFold(reason, "end_turn") || strings.EqualFold(reason, "tool_use") {
+		a.terminal = true
+		a.claudeTerminal = true
+	} else if reason != "" {
+		// Request/output limits, refusals, and control stop reasons must reach the
+		// client instead of being converted into a credential failure.
+		a.blocked = true
+	}
+}
+
+func (a *emptyCompletionAccum) evalClaudeBlocks(blocks []claudeContentBlock) {
+	for _, b := range blocks {
+		if b.Type == "tool_use" || b.Type == "server_tool_use" || b.Type == "mcp_tool_use" {
+			if (strings.TrimSpace(b.ID) != "" && strings.TrimSpace(b.Name) != "") || nonEmptyJSONPayload(b.Input) {
+				a.hasToolCalls = true
+			}
+			continue
+		}
+		if nonEmptyJSONPayload(b.Input) {
+			a.hasToolCalls = true
+			continue
+		}
+		if b.Type == "thinking" || b.Type == "redacted_thinking" || b.Type == "reasoning" || strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Data) != "" {
+			if strings.TrimSpace(b.Thinking) != "" || strings.TrimSpace(b.Data) != "" {
+				a.hasContent = true
+			}
+			continue
+		}
+		if b.Type == "text" || strings.TrimSpace(b.Text) != "" {
+			if strings.TrimSpace(b.Text) != "" {
+				a.hasContent = true
+			}
+			continue
+		}
+		if nonEmptyJSONPayload(b.Citation) {
+			a.hasContent = true
+			continue
+		}
+	}
 }
 
 // hasJSONKey reports whether the given JSON object contains name as a top-level
@@ -676,7 +848,7 @@ func (s *streamBootstrapState) finish() {
 
 // isEmptyCompletion reports the verdict for the observed prefix. A prefix that
 // produced no frame this slice can read is never empty: the streaming detector
-// only knows OpenAI chat completions, and a Responses/Claude/Gemini stream - or
+// knows OpenAI chat completions and Claude, and a Responses/Gemini stream - or
 // one whose framing it failed to split into lines at all - must pass through
 // untouched rather than be buried as an empty completion.
 func (s *streamBootstrapState) isEmptyCompletion() bool {
@@ -695,7 +867,7 @@ func (s *streamBootstrapState) isTerminalEmpty() bool {
 		// frame; do not judge the stream empty until usage arrives.
 		return false
 	}
-	return (s.sawDone || s.acc.openAITerminal) && s.isEmptyCompletion()
+	return (s.sawDone || s.acc.openAITerminal || s.acc.claudeTerminal) && s.isEmptyCompletion()
 }
 
 // setExpectedChoices tells the state how many choices the request asked for, so

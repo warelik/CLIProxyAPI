@@ -27,7 +27,7 @@ func TestIsEmptyCompletionPayloadClaude(t *testing.T) {
 		{name: "refusal empty content", payload: []byte(`{"type":"message","content":[],"stop_reason":"refusal"}`), expected: false},
 		{name: "thinking with text", payload: []byte(`{"type":"message","content":[{"type":"thinking","thinking":"let me think"}],"stop_reason":"end_turn"}`), expected: false},
 		{name: "sse max_tokens", payload: []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), expected: false},
-		{name: "gemini still unrecognized", payload: []byte(`{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":0}}`), expected: false},
+		{name: "gemini text still not empty", payload: []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}`), expected: false},
 		{name: "responses completed still unrecognized", payload: []byte(`{"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"output_tokens":0}}}`), expected: false},
 	}
 	for _, tc := range cases {
@@ -44,11 +44,6 @@ func TestClaudeFormatRecognizedAndSiblingsUntouched(t *testing.T) {
 	var claude emptyCompletionAccum
 	if !claude.evalJSON([]byte(`{"type":"message","content":[{"type":"text","text":"hello"}]}`)) || !claude.recognized {
 		t.Fatal("Claude message was not recognized")
-	}
-
-	var gemini emptyCompletionAccum
-	if gemini.evalJSON([]byte(`{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}`)) || gemini.recognized {
-		t.Fatal("Gemini must stay unrecognized in this slice")
 	}
 
 	var responses emptyCompletionAccum

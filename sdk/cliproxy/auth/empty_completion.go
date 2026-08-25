@@ -304,25 +304,204 @@ type claudeChunk struct {
 	} `json:"delta"`
 }
 
+type geminiPart struct {
+	Text                string          `json:"text"`
+	FunctionCall        json.RawMessage `json:"functionCall"`
+	InlineData          json.RawMessage `json:"inlineData"`
+	FileData            json.RawMessage `json:"fileData"`
+	FunctionResponse    json.RawMessage `json:"functionResponse"`
+	ExecutableCode      json.RawMessage `json:"executableCode"`
+	CodeExecutionResult json.RawMessage `json:"codeExecutionResult"`
+	ThoughtSignature    string          `json:"thoughtSignature"`
+	Thought_Signature   string          `json:"thought_signature"`
+}
+
+type geminiCandidate struct {
+	Index   *int `json:"index"`
+	Content *struct {
+		Parts []geminiPart `json:"parts"`
+	} `json:"content"`
+	FinishReason      *string         `json:"finishReason"`
+	GroundingMetadata json.RawMessage `json:"groundingMetadata"`
+}
+
+type geminiUsageMetadata struct {
+	CandidatesTokenCount *tokenCount `json:"candidatesTokenCount"`
+}
+
+type geminiPromptFeedback struct {
+	BlockReason string `json:"blockReason"`
+}
+
+type geminiChunk struct {
+	Candidates        []geminiCandidate     `json:"candidates"`
+	UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+	PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+	GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
+	Response          *struct {
+		Candidates        []geminiCandidate     `json:"candidates"`
+		UsageMetadata     *geminiUsageMetadata  `json:"usageMetadata"`
+		PromptFeedback    *geminiPromptFeedback `json:"promptFeedback"`
+		GroundingMetadata json.RawMessage       `json:"groundingMetadata"`
+	} `json:"response"`
+}
+
+type geminiGroundingChunk struct {
+	Web *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+	} `json:"web"`
+	RetrievedContext *struct {
+		URI   string `json:"uri"`
+		Title string `json:"title"`
+		Text  string `json:"text"`
+	} `json:"retrievedContext"`
+}
+
+type geminiGroundingMetadata struct {
+	WebSearchQueries []string               `json:"webSearchQueries"`
+	GroundingChunks  []geminiGroundingChunk `json:"groundingChunks"`
+	SearchEntryPoint *struct {
+		RenderedContent string `json:"renderedContent"`
+	} `json:"searchEntryPoint"`
+	RetrievalQueries []string `json:"retrievalQueries"`
+}
+
+// hasMeaningfulGeminiMediaPayload reports whether a Gemini media part contains
+// usable content. Matching translator semantics, inlineData counts only when
+// data is non-blank and fileData only when fileUri is non-blank; a scaffold
+// object with only a mimeType carries no media.
+func hasMeaningfulGeminiMediaPayload(inlineData, fileData json.RawMessage) bool {
+	if len(bytes.TrimSpace(inlineData)) > 0 {
+		var v struct {
+			Data string `json:"data"`
+		}
+		if json.Unmarshal(inlineData, &v) == nil && strings.TrimSpace(v.Data) != "" {
+			return true
+		}
+	}
+	if len(bytes.TrimSpace(fileData)) > 0 {
+		var v struct {
+			FileURI string `json:"fileUri"`
+		}
+		if json.Unmarshal(fileData, &v) == nil && strings.TrimSpace(v.FileURI) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isMeaningfulGeminiFunctionCall(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var call struct {
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args"`
+	}
+	if err := json.Unmarshal(trimmed, &call); err != nil {
+		return false
+	}
+	if strings.TrimSpace(call.Name) != "" {
+		return true
+	}
+	return nonEmptyJSONPayload(call.Args)
+}
+
+func hasMeaningfulGroundingMetadata(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+		return false
+	}
+	var meta geminiGroundingMetadata
+	if err := json.Unmarshal(trimmed, &meta); err == nil {
+		for _, q := range meta.WebSearchQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, q := range meta.RetrievalQueries {
+			if strings.TrimSpace(q) != "" {
+				return true
+			}
+		}
+		for _, chunk := range meta.GroundingChunks {
+			if chunk.Web != nil {
+				if strings.TrimSpace(chunk.Web.URI) != "" || strings.TrimSpace(chunk.Web.Title) != "" {
+					return true
+				}
+			}
+			if chunk.RetrievedContext != nil {
+				if strings.TrimSpace(chunk.RetrievedContext.URI) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Title) != "" ||
+					strings.TrimSpace(chunk.RetrievedContext.Text) != "" {
+					return true
+				}
+			}
+		}
+		if meta.SearchEntryPoint != nil && strings.TrimSpace(meta.SearchEntryPoint.RenderedContent) != "" {
+			return true
+		}
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(trimmed, &generic); err == nil {
+		for k, v := range generic {
+			if k == "groundingChunks" || k == "webSearchQueries" || k == "retrievalQueries" || k == "searchEntryPoint" {
+				continue
+			}
+			switch val := v.(type) {
+			case nil:
+			case string:
+				if strings.TrimSpace(val) != "" {
+					return true
+				}
+			case map[string]any:
+				if len(val) > 0 {
+					for _, mv := range val {
+						if s, ok := mv.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			case []any:
+				if len(val) > 0 {
+					for _, ev := range val {
+						if s, ok := ev.(string); ok && strings.TrimSpace(s) != "" {
+							return true
+						}
+					}
+				}
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
-// an OpenAI- or Claude-style completion is empty. Later slices add
-// Gemini/Responses evaluators onto the same accum.
+// an OpenAI-, Claude-, or Gemini-style completion is empty. Later slices add
+// Responses/Interactions evaluators onto the same accum.
 type emptyCompletionAccum struct {
-	expectedChoices       int
-	recognized            bool
-	sawUnknownData        bool
-	terminal              bool
-	hasContent            bool
-	hasToolCalls          bool
-	completionTokens      int
-	sawUsage              bool
-	blocked               bool
-	sawMetadataOnly       bool
-	sawMessageData        bool
-	openAITerminal        bool
-	claudeTerminal        bool
-	openAIChoicesSeen     map[int]bool
-	openAIChoicesFinished map[int]bool
+	expectedChoices          int
+	recognized               bool
+	sawUnknownData           bool
+	terminal                 bool
+	hasContent               bool
+	hasToolCalls             bool
+	completionTokens         int
+	sawUsage                 bool
+	blocked                  bool
+	sawMetadataOnly          bool
+	sawMessageData           bool
+	openAITerminal           bool
+	claudeTerminal           bool
+	geminiTerminal           bool
+	openAIChoicesSeen        map[int]bool
+	openAIChoicesFinished    map[int]bool
+	geminiCandidatesSeen     map[int]bool
+	geminiCandidatesFinished map[int]bool
 }
 
 func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
@@ -332,7 +511,7 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) || a.evalClaude(v) {
+		if a.evalOpenAI(v) || a.evalClaude(v) || a.evalGemini(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -586,6 +765,154 @@ func (a *emptyCompletionAccum) evalClaudeBlocks(blocks []claudeContentBlock) {
 			continue
 		}
 	}
+}
+
+// hasNestedResponseCandidates reports whether the payload's response object
+// contains a candidates key (the Gemini streaming wrapper shape).
+func hasNestedResponseCandidates(data []byte) bool {
+	var probe struct {
+		Response map[string]json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+	_, ok := probe.Response["candidates"]
+	return ok
+}
+
+func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
+	var chunk geminiChunk
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return false
+	}
+
+	candidates := chunk.Candidates
+	usage := chunk.UsageMetadata
+	promptFeedback := chunk.PromptFeedback
+
+	if chunk.Response != nil {
+		if len(candidates) == 0 {
+			candidates = chunk.Response.Candidates
+		}
+		if usage == nil {
+			usage = chunk.Response.UsageMetadata
+		}
+		if promptFeedback == nil {
+			promptFeedback = chunk.Response.PromptFeedback
+		}
+	}
+	promptBlocked := promptFeedback != nil && strings.TrimSpace(promptFeedback.BlockReason) != ""
+
+	if len(candidates) == 0 {
+		// Only treat an empty candidates array as a recognized empty completion
+		// when the candidates key is actually present. An absent candidates key
+		// is not a Gemini shape at all.
+		if hasJSONKey(data, "candidates") || hasNestedResponseCandidates(data) {
+			a.recognized = true
+			a.sawMessageData = true
+			a.terminal = true
+			a.blocked = promptBlocked
+			if !promptBlocked {
+				a.geminiTerminal = true
+			}
+			if usage != nil && usage.CandidatesTokenCount != nil {
+				a.sawUsage = true
+				a.addUsage(*usage.CandidatesTokenCount)
+			}
+			return true
+		}
+		return false
+	}
+
+	a.recognized = true
+	a.sawMessageData = true
+	if promptBlocked {
+		a.blocked = true
+	}
+
+	if usage != nil {
+		if usage.CandidatesTokenCount != nil {
+			a.sawUsage = true
+			a.addUsage(*usage.CandidatesTokenCount)
+		}
+	}
+	if hasMeaningfulGroundingMetadata(chunk.GroundingMetadata) {
+		a.hasContent = true
+	}
+	if chunk.Response != nil && hasMeaningfulGroundingMetadata(chunk.Response.GroundingMetadata) {
+		a.hasContent = true
+	}
+
+	if a.geminiCandidatesSeen == nil {
+		a.geminiCandidatesSeen = make(map[int]bool)
+		a.geminiCandidatesFinished = make(map[int]bool)
+	}
+
+	blocked := false
+	for i, cand := range candidates {
+		idx := i
+		if cand.Index != nil {
+			idx = *cand.Index
+		}
+		a.geminiCandidatesSeen[idx] = true
+		if cand.FinishReason != nil {
+			reason := strings.TrimSpace(*cand.FinishReason)
+			if reason != "" {
+				if strings.EqualFold(reason, "STOP") {
+					a.geminiCandidatesFinished[idx] = true
+					a.terminal = true
+				} else {
+					// SAFETY, RECITATION, MAX_TOKENS, BLOCKLIST,
+					// PROHIBITED_CONTENT, OTHER: the client must see the
+					// stop/block reason rather than a silent auth rotation.
+					blocked = true
+					a.terminal = true
+				}
+			}
+		}
+		if hasMeaningfulGroundingMetadata(cand.GroundingMetadata) {
+			a.hasContent = true
+		}
+		if cand.Content != nil {
+			for _, part := range cand.Content.Parts {
+				if isMeaningfulGeminiFunctionCall(part.FunctionCall) {
+					a.hasToolCalls = true
+				}
+				if hasMeaningfulGeminiMediaPayload(part.InlineData, part.FileData) ||
+					nonEmptyJSONPayload(part.FunctionResponse) {
+					a.hasContent = true
+				}
+				if nonEmptyJSONPayload(part.ExecutableCode) || nonEmptyJSONPayload(part.CodeExecutionResult) {
+					a.hasContent = true
+				}
+				if strings.TrimSpace(part.Text) != "" {
+					a.hasContent = true
+				}
+				// thoughtSignature / thought_signature is not visible content
+				// and does not spend tokens; a lonely signature is empty.
+			}
+		}
+	}
+
+	if blocked {
+		a.blocked = true
+	}
+
+	expected := a.expectedChoices
+	if expected <= 0 {
+		expected = 1
+	}
+	targetCandidates := expected
+	if len(a.geminiCandidatesSeen) > targetCandidates {
+		targetCandidates = len(a.geminiCandidatesSeen)
+	}
+	if len(a.geminiCandidatesFinished) >= targetCandidates && len(a.geminiCandidatesFinished) >= len(a.geminiCandidatesSeen) && !a.blocked {
+		a.geminiTerminal = true
+	} else {
+		a.geminiTerminal = false
+	}
+
+	return true
 }
 
 // hasJSONKey reports whether the given JSON object contains name as a top-level
@@ -848,9 +1175,10 @@ func (s *streamBootstrapState) finish() {
 
 // isEmptyCompletion reports the verdict for the observed prefix. A prefix that
 // produced no frame this slice can read is never empty: the streaming detector
-// knows OpenAI chat completions and Claude, and a Responses/Gemini stream - or
-// one whose framing it failed to split into lines at all - must pass through
-// untouched rather than be buried as an empty completion.
+// knows OpenAI chat completions, Claude, and Gemini, and a Responses/
+// Interactions stream - or one whose framing it failed to split into lines at
+// all - must pass through untouched rather than be buried as an empty
+// completion.
 func (s *streamBootstrapState) isEmptyCompletion() bool {
 	if !s.acc.recognized {
 		return false
@@ -867,7 +1195,7 @@ func (s *streamBootstrapState) isTerminalEmpty() bool {
 		// frame; do not judge the stream empty until usage arrives.
 		return false
 	}
-	return (s.sawDone || s.acc.openAITerminal || s.acc.claudeTerminal) && s.isEmptyCompletion()
+	return (s.sawDone || s.acc.openAITerminal || s.acc.claudeTerminal || s.acc.geminiTerminal) && s.isEmptyCompletion()
 }
 
 // setExpectedChoices tells the state how many choices the request asked for, so
@@ -1003,24 +1331,75 @@ func couldBeSSEPrefix(payload []byte) bool {
 		value == "data" || value == "event" || value == "id" || value == "retry"
 }
 
-// extractExpectedChoices reports how many OpenAI choices the request asked for
-// (top-level "n"). Without it a two-choice stream whose first choice finishes
-// empty looks terminal while the second choice is still to come, and a live
-// credential is rotated away. Anything unparseable or absent means one choice.
+// extractExpectedChoices reports how many OpenAI choices or Gemini candidates
+// the request asked for (top-level "n", or generationConfig.candidateCount).
+// Without it a two-candidate stream whose first candidate finishes empty looks
+// terminal while the second is still to come, and a live credential is rotated
+// away. Anything unparseable or absent means one choice.
 func extractExpectedChoices(payload []byte) int {
 	if len(payload) == 0 {
 		return 1
 	}
 	var req struct {
-		N *int `json:"n"`
+		N                *int `json:"n"`
+		CandidateCount   *int `json:"candidateCount"`
+		Candidate_Count  *int `json:"candidate_count"`
+		GenerationConfig *struct {
+			CandidateCount  *int `json:"candidateCount"`
+			Candidate_Count *int `json:"candidate_count"`
+		} `json:"generationConfig"`
+		Generation_Config *struct {
+			CandidateCount  *int `json:"candidateCount"`
+			Candidate_Count *int `json:"candidate_count"`
+		} `json:"generation_config"`
+		Request *struct {
+			N                *int `json:"n"`
+			CandidateCount   *int `json:"candidateCount"`
+			Candidate_Count  *int `json:"candidate_count"`
+			GenerationConfig *struct {
+				CandidateCount  *int `json:"candidateCount"`
+				Candidate_Count *int `json:"candidate_count"`
+			} `json:"generationConfig"`
+			Generation_Config *struct {
+				CandidateCount  *int `json:"candidateCount"`
+				Candidate_Count *int `json:"candidate_count"`
+			} `json:"generation_config"`
+		} `json:"request"`
 	}
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return 1
 	}
-	if req.N != nil && *req.N > 1 {
-		return *req.N
+	maxChoices := 1
+	updateMax := func(ptr *int) {
+		if ptr != nil && *ptr > maxChoices {
+			maxChoices = *ptr
+		}
 	}
-	return 1
+	updateMax(req.N)
+	updateMax(req.CandidateCount)
+	updateMax(req.Candidate_Count)
+	if req.GenerationConfig != nil {
+		updateMax(req.GenerationConfig.CandidateCount)
+		updateMax(req.GenerationConfig.Candidate_Count)
+	}
+	if req.Generation_Config != nil {
+		updateMax(req.Generation_Config.CandidateCount)
+		updateMax(req.Generation_Config.Candidate_Count)
+	}
+	if req.Request != nil {
+		updateMax(req.Request.N)
+		updateMax(req.Request.CandidateCount)
+		updateMax(req.Request.Candidate_Count)
+		if req.Request.GenerationConfig != nil {
+			updateMax(req.Request.GenerationConfig.CandidateCount)
+			updateMax(req.Request.GenerationConfig.Candidate_Count)
+		}
+		if req.Request.Generation_Config != nil {
+			updateMax(req.Request.Generation_Config.CandidateCount)
+			updateMax(req.Request.Generation_Config.Candidate_Count)
+		}
+	}
+	return maxChoices
 }
 
 // isEmptyCompletionPayload reports whether a payload (aggregated SSE chunks or

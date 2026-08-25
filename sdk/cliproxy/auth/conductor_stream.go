@@ -9,14 +9,64 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
+// streamDrainTimeout bounds how long an abandoned upstream source is drained
+// while it produces nothing. A provider that neither sends nor closes would
+// otherwise pin the drain goroutine and its connection for as long as the
+// request lives, and one request may abandon several sources while failing over
+// across models and credentials.
+//
+// This is not a timeout on any stream a caller reads: AGENTS.md:58 forbids
+// those after the upstream connection is established, and by the time this
+// budget starts the conductor has already decided that not one byte of this
+// source will reach the client. It bounds cleanup, not delivery.
+const streamDrainTimeout = 5 * time.Second
+
+// discardStreamChunks drains an abandoned upstream source so its producer is
+// unblocked and its connection released, and returns a channel closed when the
+// drain is over. A bare `for range ch` is not enough: the conductor abandons a
+// source it is still holding open (terminal empty, model failover), and an
+// upstream that never closes the channel would leak the goroutine forever.
+func discardStreamChunks(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) <-chan struct{} {
+	return drainStreamChunks(ctx, ch, streamDrainTimeout)
+}
+
+// drainStreamChunks is discardStreamChunks with an explicit idle budget. The
+// budget is a parameter rather than a mutable package variable so a caller that
+// needs a shorter one cannot race the drain goroutines already reading it.
+func drainStreamChunks(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, idleTimeout time.Duration) <-chan struct{} {
+	done := make(chan struct{})
 	if ch == nil {
-		return
+		close(done)
+		return done
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	go func() {
-		for range ch {
+		defer close(done)
+		timer := time.NewTimer(idleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idleTimeout)
+			}
 		}
 	}()
+	return done
 }
 
 type streamBootstrapError struct {
@@ -82,11 +132,18 @@ func validateStreamResult(result *cliproxyexecutor.StreamResult, err error) (*cl
 	return result, nil
 }
 
-func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
+func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk, requestPayloads ...[]byte) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	var bootstrap streamBootstrapState
+	for _, p := range requestPayloads {
+		if n := extractExpectedChoices(p); n > 1 {
+			bootstrap.setExpectedChoices(n)
+			break
+		}
+	}
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -105,11 +162,29 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			return buffered, true, nil
 		}
 		if chunk.Err != nil {
+			// The prefix already carries bytes the caller would lose, so this
+			// is a mid-stream failure and belongs to the forwarded stream.
+			// Reporting it as a bootstrap error would fail over a request that
+			// has already begun answering.
+			if bootstrap.hasMeaningfulOutput() {
+				buffered = append(buffered, chunk)
+				return buffered, false, nil
+			}
 			return nil, false, chunk.Err
 		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		// A non-empty frame is not the same as output: an SSE preamble, a
+		// zero-choice keep-alive, or a bare [DONE] all carry bytes and nothing
+		// else. Forward only once the prefix actually holds output, otherwise
+		// an empty completion is committed as a success and never fails over.
+		if bootstrap.observe(chunk.Payload) {
 			return buffered, false, nil
+		}
+		// The terminal marker already arrived with nothing in it. Report the
+		// prefix as closed so the caller judges it now: an upstream that stalls
+		// after its own terminal frame would otherwise hold the request open.
+		if bootstrap.isTerminalEmpty() {
+			return buffered, true, nil
 		}
 	}
 }
@@ -174,13 +249,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		for _, chunk := range buffered {
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				discardStreamChunks(ctx, remaining)
 				return
 			}
 		}
 		for chunk := range remaining {
 			if ok := emit(chunk); !ok {
-				discardStreamChunks(remaining)
+				discardStreamChunks(ctx, remaining)
 				return
 			}
 		}
@@ -315,10 +390,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			continue
 		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks, execReq.Payload, execOpts.OriginalRequest)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, errCtx
 			}
 			if allowRetry {
@@ -333,12 +408,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 				}
 				if errRefresh != nil {
-					discardStreamChunks(streamResult.Chunks)
+					discardStreamChunks(ctx, streamResult.Chunks)
 					bootstrapErr = errRefresh
 					warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), bootstrapErr)
 					streamResult = &cliproxyexecutor.StreamResult{}
 				} else if okRefresh {
-					discardStreamChunks(streamResult.Chunks)
+					discardStreamChunks(ctx, streamResult.Chunks)
 					auth = refreshed
 					m.replaceHomeExecutionLifecycleAuth(execOpts.ExecutionLifecycle, auth)
 					publishSelectedAuthMetadata(execOpts.Metadata, auth)
@@ -356,7 +431,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						streamResult = &cliproxyexecutor.StreamResult{}
 					} else {
 						streamResult = retryStream
-						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks, execReq.Payload, execOpts.OriginalRequest)
 						if bootstrapErr != nil {
 							warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startRetry), bootstrapErr)
 						}
@@ -370,7 +445,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if !ephemeralResult {
 			if errCancel := claudeOAuthRequestCancellation(ctx, auth, bootstrapErr); errCancel != nil {
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, errCancel
 			}
 		}
@@ -385,7 +460,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				applyRequestScopedActionToResult(action, okAction, &result)
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				if isRequestScopedStop(action, okAction) {
 					return nil, wrapRequestStopError(bootstrapErr)
 				}
@@ -403,7 +478,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.CredentialScope = true
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
@@ -414,7 +489,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.CredentialScope = true
 				}
 				m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-				discardStreamChunks(streamResult.Chunks)
+				discardStreamChunks(ctx, streamResult.Chunks)
 				lastErr = bootstrapErr
 				if result.CredentialScope {
 					return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
@@ -428,15 +503,32 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.CredentialScope = true
 			}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			discardStreamChunks(streamResult.Chunks)
+			discardStreamChunks(ctx, streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
-		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+		payloadBytes := 0
+		for _, chunk := range buffered {
+			payloadBytes += len(chunk.Payload)
+		}
+		// Emptiness is decided on buffered payload bytes and on the aggregated
+		// prefix, not on the chunk count: zero-payload chunks are dropped
+		// downstream by wrapStreamResult, and a prefix of pure protocol frames
+		// (a lone [DONE], a stop with zero completion tokens) is a completed
+		// response that says nothing. Both surfaced as a successful empty
+		// stream with no failover.
+		if closed && (payloadBytes == 0 || isEmptyCompletion(buffered)) {
+			emptyErr := errEmptyCompletion
+			if payloadBytes == 0 {
+				emptyErr = &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+			}
 			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, Options: execOpts}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
+			// The source may still be open here: a terminal-empty prefix ends
+			// the read before the channel closes. Leaving it undrained blocks
+			// the producer and holds the upstream connection.
+			discardStreamChunks(ctx, streamResult.Chunks)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -446,6 +538,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		remaining := streamResult.Chunks
 		if closed {
+			discardStreamChunks(ctx, streamResult.Chunks)
 			closedCh := make(chan cliproxyexecutor.StreamChunk)
 			close(closedCh)
 			remaining = closedCh

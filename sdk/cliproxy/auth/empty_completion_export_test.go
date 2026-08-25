@@ -15,6 +15,9 @@ func TestExportedEmptyCompletionWrappers(t *testing.T) {
 	if EmptyCompletionError() != errEmptyCompletion {
 		t.Fatal("EmptyCompletionError() is not errEmptyCompletion")
 	}
+	if EmptyCountError() != errEmptyCount {
+		t.Fatal("EmptyCountError() is not errEmptyCount")
+	}
 
 	payload := []byte(`{"n":2,"generationConfig":{"candidateCount":3}}`)
 	if got, want := ExtractExpectedChoices(payload), extractExpectedChoices(payload); got != want || got != 3 {

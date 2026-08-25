@@ -334,7 +334,14 @@ func (h *Host) CountPluginExecutor(ctx context.Context, pluginID string, req cor
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	return adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
+	resp, err := adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
+	if err != nil {
+		return coreexecutor.Response{}, err
+	}
+	if coreauth.IsEmptyCompletionPayload(resp.Payload) {
+		return coreexecutor.Response{}, coreauth.EmptyCountError()
+	}
+	return resp, nil
 }
 
 func (h *Host) executorAdapterForPlugin(pluginID string) (*executorAdapter, error) {

@@ -70,6 +70,16 @@ var errEmptyCompletion = &Error{
 	HTTPStatus: http.StatusServiceUnavailable,
 }
 
+// errEmptyCount indicates the upstream returned an empty count response. It is
+// retriable so the conductor marks the auth as failed, cools it down, and
+// rotates to the next auth/model.
+var errEmptyCount = &Error{
+	Code:       "empty_count",
+	Message:    "upstream returned an empty count response",
+	Retryable:  true,
+	HTTPStatus: http.StatusServiceUnavailable,
+}
+
 // maxStreamBootstrapBytes caps how much of a stream prefix the bootstrap
 // detector buffers before it gives up and forwards. It bounds memory per
 // in-flight stream and keeps a long metadata preamble from delaying the
@@ -2669,4 +2679,19 @@ func (m *Manager) markEmptyCompletion(ctx context.Context, result *Result) error
 	result.Error = errEmptyCompletion
 	m.MarkResult(ctx, *result)
 	return errEmptyCompletion
+}
+
+// markEmptyCount records a failed retriable empty count-tokens result and
+// returns the error to propagate. It is the count analogue of markEmptyCompletion
+// and uses errEmptyCount so count failures have a consistent code everywhere.
+func (m *Manager) markEmptyCount(ctx context.Context, result *Result) error {
+	result.Success = false
+	result.Error = errEmptyCount
+	m.MarkResult(ctx, *result)
+	return errEmptyCount
+}
+
+func isEmptyCompletionError(err error) bool {
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == errEmptyCompletion.Code
 }

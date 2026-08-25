@@ -244,6 +244,64 @@ func TestHostExecutePluginExecutorStreamRejectsEmptyCompletion(t *testing.T) {
 	}
 }
 
+func TestHostCountPluginExecutorRejectsEmptyCount(t *testing.T) {
+	executor := &fakeExecutor{
+		identifier: "plugin-provider",
+		countTokens: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			return pluginapi.ExecutorResponse{Payload: []byte(`{"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}`)}, nil
+		},
+	}
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "executor",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor:              executor,
+			ExecutorInputFormats:  []string{"openai"},
+			ExecutorOutputFormats: []string{"openai"},
+		}},
+	})
+
+	_, errCount := host.CountPluginExecutor(context.Background(), "executor", coreexecutor.Request{Model: "client-model", Payload: []byte(`{"model":"client-model"}`)}, coreexecutor.Options{})
+	if errCount == nil {
+		t.Fatal("CountPluginExecutor() with empty count = nil, want retriable error")
+	}
+	var authErr *coreauth.Error
+	if !errors.As(errCount, &authErr) {
+		t.Fatalf("error = %v (%T), want *coreauth.Error", errCount, errCount)
+	}
+	if !authErr.Retryable || authErr.Code != "empty_count" {
+		t.Fatalf("error = %+v, want retriable empty_count", authErr)
+	}
+	if authErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("error status = %d, want %d", authErr.StatusCode(), http.StatusServiceUnavailable)
+	}
+}
+
+func TestHostCountPluginExecutorLivePassThrough(t *testing.T) {
+	live := []byte(`{"input_tokens":12}`)
+	executor := &fakeExecutor{
+		identifier: "plugin-provider",
+		countTokens: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			return pluginapi.ExecutorResponse{Payload: live}, nil
+		},
+	}
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "executor",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor:              executor,
+			ExecutorInputFormats:  []string{"openai"},
+			ExecutorOutputFormats: []string{"openai"},
+		}},
+	})
+
+	resp, errCount := host.CountPluginExecutor(context.Background(), "executor", coreexecutor.Request{Model: "client-model", Payload: []byte(`{"model":"client-model"}`)}, coreexecutor.Options{})
+	if errCount != nil {
+		t.Fatalf("CountPluginExecutor() live error = %v, want success", errCount)
+	}
+	if string(resp.Payload) != string(live) {
+		t.Fatalf("payload = %q, want byte-for-byte live count", resp.Payload)
+	}
+}
+
 func TestHostExecutePluginExecutorStreamRejectsNilChunks(t *testing.T) {
 	executor := &fakeExecutor{
 		identifier: "plugin-provider",

@@ -17,6 +17,13 @@ func EmptyCompletionError() error {
 	return errEmptyCompletion
 }
 
+// EmptyCountError returns the retriable error used when upstream returns an
+// empty count-tokens response. The plugin-executor path returns it so count
+// failures use the same code as the conductor's count path.
+func EmptyCountError() error {
+	return errEmptyCount
+}
+
 // ExtractExpectedChoices parses the request payload to extract the choice count
 // parameter (top-level "n" for OpenAI or "generationConfig.candidateCount" for
 // Gemini). Returns 1 if payload is empty, invalid, or choice count is omitted

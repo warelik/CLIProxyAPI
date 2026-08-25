@@ -367,6 +367,231 @@ type geminiGroundingMetadata struct {
 	RetrievalQueries []string `json:"retrievalQueries"`
 }
 
+// openAIResponseUsage is the usage block of the OpenAI Responses-API shape
+// (used by codex/xai executors).
+type openAIResponseUsage struct {
+	OutputTokens *tokenCount `json:"output_tokens"`
+}
+
+type openAIResponseContentPart struct {
+	Type        string            `json:"type"`
+	Text        string            `json:"text"`
+	Refusal     string            `json:"refusal"`
+	Annotations []json.RawMessage `json:"annotations"`
+}
+
+type openAIResponseOutputItem struct {
+	ID               string                      `json:"id"`
+	CallID           string                      `json:"call_id"`
+	Name             string                      `json:"name"`
+	Input            string                      `json:"input"`
+	Type             string                      `json:"type"`
+	Text             string                      `json:"text"`
+	Arguments        string                      `json:"arguments"`
+	Result           string                      `json:"result"`
+	Action           json.RawMessage             `json:"action"`
+	Results          json.RawMessage             `json:"results"`
+	Content          []openAIResponseContentPart `json:"content"`
+	EncryptedContent string                      `json:"encrypted_content"`
+	Summary          json.RawMessage             `json:"summary"`
+}
+
+type openAIResponseObject struct {
+	Status string               `json:"status"`
+	Output json.RawMessage      `json:"output"`
+	Usage  *openAIResponseUsage `json:"usage"`
+}
+
+type openAIResponsePart struct {
+	Type             string            `json:"type"`
+	Text             string            `json:"text"`
+	EncryptedContent string            `json:"encrypted_content"`
+	Annotations      []json.RawMessage `json:"annotations"`
+}
+
+type openAIResponseChunk struct {
+	Type      string                `json:"type"`
+	Object    string                `json:"object"`
+	Status    string                `json:"status"`
+	Output    json.RawMessage       `json:"output"`
+	Item      json.RawMessage       `json:"item"`
+	Part      json.RawMessage       `json:"part"`
+	Usage     *openAIResponseUsage  `json:"usage"`
+	Response  *openAIResponseObject `json:"response"`
+	Delta     string                `json:"delta"`
+	Text      string                `json:"text"`
+	Arguments string                `json:"arguments"`
+}
+
+// openAIResponseEventTypes is the conservative set of Responses-API streamed
+// event types we recognize. Unknown/partial sub-shapes are left unrecognized so
+// the stream is forwarded rather than judged empty.
+var openAIResponseEventTypes = map[string]bool{
+	"response.created":                       true,
+	"response.in_progress":                   true,
+	"response.completed":                     true,
+	"response.incomplete":                    true,
+	"response.failed":                        true,
+	"response.output_item.added":             true,
+	"response.output_item.done":              true,
+	"response.content_part.added":            true,
+	"response.content_part.done":             true,
+	"response.output_text.delta":             true,
+	"response.output_text.done":              true,
+	"response.reasoning_summary_part.added":  true,
+	"response.reasoning_summary_part.done":   true,
+	"response.reasoning_summary_text.delta":  true,
+	"response.reasoning_summary_text.done":   true,
+	"response.reasoning_text.delta":          true,
+	"response.reasoning_text.done":           true,
+	"response.function_call_arguments.delta": true,
+	"response.function_call_arguments.done":  true,
+	"response.web_search_call.in_progress":   true,
+	"response.web_search_call.searching":     true,
+	"response.web_search_call.completed":     true,
+	"error":                                  true,
+	"codex.rate_limits":                      true,
+	"codex.response.metadata":                true,
+}
+
+var interactionsEventTypes = map[string]bool{
+	"interaction.created":       true,
+	"interaction.status_update": true,
+	"interaction.completed":     true,
+	"interaction.failed":        true,
+	"finish":                    true,
+	"step.start":                true,
+	"step.delta":                true,
+	"step.stop":                 true,
+}
+
+type interactionsChunk struct {
+	Object        string             `json:"object"`
+	EventType     string             `json:"event_type"`
+	Type          string             `json:"type"`
+	Status        string             `json:"status"`
+	InteractionID string             `json:"interaction_id"`
+	Steps         []interactionsStep `json:"steps"`
+	Step          *interactionsStep  `json:"step"`
+	Delta         *interactionsDelta `json:"delta"`
+	Usage         *interactionsUsage `json:"usage"`
+	Metadata      *interactionsMeta  `json:"metadata"`
+	Interaction   *struct {
+		ID     string             `json:"id"`
+		Status string             `json:"status"`
+		Object string             `json:"object"`
+		Steps  []interactionsStep `json:"steps"`
+		Usage  *interactionsUsage `json:"usage"`
+	} `json:"interaction"`
+}
+
+type interactionsMeta struct {
+	TotalUsage *interactionsUsage `json:"total_usage"`
+	Usage      *interactionsUsage `json:"usage"`
+}
+
+type interactionsUsage struct {
+	OutputTokens      *tokenCount `json:"output_tokens"`
+	TotalOutputTokens *tokenCount `json:"total_output_tokens"`
+	CompletionTokens  *tokenCount `json:"completion_tokens"`
+}
+
+type interactionsStep struct {
+	ID                    string                    `json:"id"`
+	CallID                string                    `json:"call_id"`
+	Type                  string                    `json:"type"`
+	Name                  string                    `json:"name"`
+	Arguments             json.RawMessage           `json:"arguments"`
+	Content               []interactionsContent     `json:"content"`
+	Result                json.RawMessage           `json:"result"`
+	Signature             string                    `json:"signature"`
+	ThoughtSignature      string                    `json:"thought_signature"`
+	ThoughtSignatureCamel string                    `json:"thoughtSignature"`
+	EncryptedContent      string                    `json:"encrypted_content"`
+	ExtraContent          *interactionsExtraContent `json:"extra_content"`
+}
+
+// interactionsExtraContent carries the vendor-specific envelope Gemini uses to
+// ship a thought signature alongside a step.
+type interactionsExtraContent struct {
+	Google *struct {
+		ThoughtSignature string `json:"thought_signature"`
+	} `json:"google"`
+}
+
+// hasSignature reports whether the step carries a reasoning signature.
+// A signature without text, a tool-call, or positive completion tokens is not
+// content: treating it as live would keep a dead Gemini/Claude credential in
+// the pool.
+func (s *interactionsStep) hasSignature() bool {
+	if s == nil {
+		return false
+	}
+	if strings.TrimSpace(s.Signature) != "" ||
+		strings.TrimSpace(s.ThoughtSignature) != "" ||
+		strings.TrimSpace(s.ThoughtSignatureCamel) != "" ||
+		strings.TrimSpace(s.EncryptedContent) != "" {
+		return true
+	}
+	if s.ExtraContent != nil && s.ExtraContent.Google != nil {
+		return strings.TrimSpace(s.ExtraContent.Google.ThoughtSignature) != ""
+	}
+	return false
+}
+
+type interactionsContent struct {
+	Type                  string `json:"type"`
+	Text                  string `json:"text"`
+	Data                  string `json:"data"`
+	FileURI               string `json:"file_uri"`
+	FileUri               string `json:"fileUri"`
+	URL                   string `json:"url"`
+	MimeType              string `json:"mime_type"`
+	Mime_Type             string `json:"mimeType"`
+	Signature             string `json:"signature"`
+	ThoughtSignature      string `json:"thought_signature"`
+	ThoughtSignatureCamel string `json:"thoughtSignature"`
+}
+
+func (c *interactionsContent) hasMeaningfulContent() bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.Text) != "" ||
+		strings.TrimSpace(c.Data) != "" ||
+		strings.TrimSpace(c.FileURI) != "" ||
+		strings.TrimSpace(c.FileUri) != "" ||
+		strings.TrimSpace(c.URL) != ""
+}
+
+type interactionsDelta struct {
+	Type                  string               `json:"type"`
+	Text                  string               `json:"text"`
+	Data                  string               `json:"data"`
+	FileURI               string               `json:"file_uri"`
+	FileUri               string               `json:"fileUri"`
+	URL                   string               `json:"url"`
+	Arguments             json.RawMessage      `json:"arguments"`
+	Signature             string               `json:"signature"`
+	ThoughtSignature      string               `json:"thought_signature"`
+	ThoughtSignatureCamel string               `json:"thoughtSignature"`
+	Name                  string               `json:"name"`
+	Content               *interactionsContent `json:"content"`
+	Result                json.RawMessage      `json:"result"`
+}
+
+func hasMeaningfulInteractionsArguments(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		return hasMeaningfulJSONArguments(str)
+	}
+	return nonEmptyJSONPayload(raw)
+}
+
 // hasMeaningfulGeminiMediaPayload reports whether a Gemini media part contains
 // usable content. Matching translator semantics, inlineData counts only when
 // data is non-blank and fileData only when fileUri is non-blank; a scaffold
@@ -481,8 +706,8 @@ func hasMeaningfulGroundingMetadata(raw json.RawMessage) bool {
 }
 
 // emptyCompletionAccum accumulates the properties relevant to deciding whether
-// an OpenAI-, Claude-, or Gemini-style completion is empty. Later slices add
-// Responses/Interactions evaluators onto the same accum.
+// an OpenAI-, Claude-, Gemini-, Responses-, or Interactions-style completion
+// is empty.
 type emptyCompletionAccum struct {
 	expectedChoices          int
 	recognized               bool
@@ -498,6 +723,7 @@ type emptyCompletionAccum struct {
 	openAITerminal           bool
 	claudeTerminal           bool
 	geminiTerminal           bool
+	interactionsTerminal     bool
 	openAIChoicesSeen        map[int]bool
 	openAIChoicesFinished    map[int]bool
 	geminiCandidatesSeen     map[int]bool
@@ -511,7 +737,7 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) || a.evalClaude(v) || a.evalGemini(v) {
+		if a.evalOpenAI(v) || a.evalClaude(v) || a.evalOpenAIResponse(v) || a.evalGemini(v) || a.evalInteractions(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -915,6 +1141,420 @@ func (a *emptyCompletionAccum) evalGemini(data []byte) bool {
 	return true
 }
 
+func (a *emptyCompletionAccum) evalOpenAIResponse(data []byte) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+
+	var evType string
+	if raw := probe["type"]; raw != nil {
+		_ = json.Unmarshal(raw, &evType)
+	}
+	var objName string
+	if raw := probe["object"]; raw != nil {
+		_ = json.Unmarshal(raw, &objName)
+	}
+
+	if objName != "response" && !openAIResponseEventTypes[evType] {
+		return false
+	}
+	a.recognized = true
+	a.sawMessageData = true
+
+	var chunk openAIResponseChunk
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return true
+	}
+
+	switch evType {
+	case "response.completed":
+		// Terminal Responses-API frames are valid completions even with empty
+		// output (see codex responses tests); never judge them empty.
+		a.terminal = true
+		a.blocked = true
+	case "response.incomplete", "response.failed", "error":
+		a.terminal = true
+		a.blocked = true
+	}
+	a.evalOpenAIResponseStatus(chunk.Status)
+	if chunk.Response != nil {
+		a.evalOpenAIResponseStatus(chunk.Response.Status)
+	}
+
+	if chunk.Usage != nil && chunk.Usage.OutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*chunk.Usage.OutputTokens)
+	}
+	if chunk.Response != nil && chunk.Response.Usage != nil && chunk.Response.Usage.OutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*chunk.Response.Usage.OutputTokens)
+	}
+
+	switch evType {
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		if strings.TrimSpace(chunk.Delta) != "" {
+			a.hasContent = true
+		}
+	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		if strings.TrimSpace(chunk.Text) != "" {
+			a.hasContent = true
+		}
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.content_part.added", "response.content_part.done":
+		var part openAIResponsePart
+		if err := json.Unmarshal(chunk.Part, &part); err == nil {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" || hasMeaningfulAnnotations(part.Annotations) {
+				a.hasContent = true
+			}
+		}
+	case "response.output_item.done":
+		var item openAIResponseOutputItem
+		if err := json.Unmarshal(chunk.Item, &item); err == nil {
+			itemType := strings.ToLower(strings.TrimSpace(item.Type))
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
+				if hasMeaningfulResponsesCallItem(item) {
+					a.hasToolCalls = true
+				}
+			}
+		}
+		if err := json.Unmarshal(chunk.Output, &item); err == nil {
+			itemType := strings.ToLower(strings.TrimSpace(item.Type))
+			if strings.HasSuffix(itemType, "_call") && itemType != "image_generation_call" {
+				if hasMeaningfulResponsesCallItem(item) {
+					a.hasToolCalls = true
+				}
+			}
+		}
+	case "response.function_call_arguments.delta", "response.function_call_arguments.done":
+		if a.hasToolCalls || hasMeaningfulJSONArguments(chunk.Delta) || hasMeaningfulJSONArguments(chunk.Arguments) {
+			a.hasToolCalls = true
+		}
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed",
+		"codex.rate_limits", "codex.response.metadata":
+	}
+
+	a.evalOpenAIResponseRawOutput(chunk.Output)
+	a.evalOpenAIResponseRawOutput(chunk.Item)
+	if chunk.Response != nil {
+		a.evalOpenAIResponseRawOutput(chunk.Response.Output)
+	}
+
+	return true
+}
+
+func (a *emptyCompletionAccum) evalOpenAIResponseStatus(status string) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed":
+		a.terminal = true
+		a.blocked = true
+	case "incomplete", "failed", "error":
+		a.terminal = true
+		a.blocked = true
+	}
+}
+
+func (a *emptyCompletionAccum) evalOpenAIResponseRawOutput(raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var items []openAIResponseOutputItem
+	if err := json.Unmarshal(raw, &items); err == nil {
+		a.evalOpenAIResponseOutput(items)
+		return
+	}
+	var item openAIResponseOutputItem
+	if err := json.Unmarshal(raw, &item); err == nil {
+		a.evalOpenAIResponseOutput([]openAIResponseOutputItem{item})
+	}
+}
+
+func hasMeaningfulResponsesCallItem(item openAIResponseOutputItem) bool {
+	return strings.TrimSpace(item.Name) != "" ||
+		hasMeaningfulJSONArguments(item.Arguments) ||
+		strings.TrimSpace(item.Input) != "" ||
+		strings.TrimSpace(item.Result) != "" ||
+		nonEmptyJSONPayload(item.Action) ||
+		nonEmptyJSONPayload(item.Results)
+}
+
+func hasMeaningfulResponsesImageGenerationCallItem(item openAIResponseOutputItem) bool {
+	return strings.TrimSpace(item.Result) != "" || strings.TrimSpace(item.Text) != ""
+}
+
+func hasMeaningfulResponsesReasoningSummary(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var parts []openAIResponsePart
+	if err := json.Unmarshal(trimmed, &parts); err == nil {
+		for _, part := range parts {
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.EncryptedContent) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var single openAIResponsePart
+	if err := json.Unmarshal(trimmed, &single); err == nil {
+		return strings.TrimSpace(single.Text) != "" || strings.TrimSpace(single.EncryptedContent) != ""
+	}
+	var strSlice []string
+	if err := json.Unmarshal(trimmed, &strSlice); err == nil {
+		for _, s := range strSlice {
+			if strings.TrimSpace(s) != "" {
+				return true
+			}
+		}
+		return false
+	}
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		return strings.TrimSpace(str) != ""
+	}
+	return false
+}
+
+func hasMeaningfulAnnotations(annotations []json.RawMessage) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+	for _, raw := range annotations {
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("{}")) || bytes.Equal(trimmed, []byte("[]")) {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal(trimmed, &obj); err == nil {
+			hasField := false
+			for _, v := range obj {
+				switch val := v.(type) {
+				case nil:
+				case string:
+					if strings.TrimSpace(val) != "" {
+						hasField = true
+					}
+				default:
+					hasField = true
+				}
+				if hasField {
+					break
+				}
+			}
+			if hasField {
+				return true
+			}
+			continue
+		}
+		var str string
+		if err := json.Unmarshal(trimmed, &str); err == nil {
+			if strings.TrimSpace(str) != "" {
+				return true
+			}
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (a *emptyCompletionAccum) evalOpenAIResponseOutput(items []openAIResponseOutputItem) {
+	for _, item := range items {
+		itemType := strings.ToLower(strings.TrimSpace(item.Type))
+		switch {
+		case itemType == "image_generation_call":
+			if hasMeaningfulResponsesImageGenerationCallItem(item) {
+				a.hasContent = true
+			}
+		case strings.HasSuffix(itemType, "_call"):
+			if hasMeaningfulResponsesCallItem(item) {
+				a.hasToolCalls = true
+			}
+		case itemType == "reasoning":
+			if strings.TrimSpace(item.EncryptedContent) != "" || hasMeaningfulResponsesReasoningSummary(item.Summary) {
+				a.hasContent = true
+			}
+		case itemType != "" && itemType != "message":
+			// Responses may add output item types over time. A complete, typed
+			// non-message item is output unless the protocol proves otherwise.
+			a.hasContent = true
+		}
+		if strings.TrimSpace(item.Text) != "" {
+			a.hasContent = true
+		}
+		for _, part := range item.Content {
+			partType := strings.ToLower(strings.TrimSpace(part.Type))
+			if strings.TrimSpace(part.Text) != "" || strings.TrimSpace(part.Refusal) != "" ||
+				hasMeaningfulAnnotations(part.Annotations) ||
+				partType == "refusal" || (partType != "" && partType != "output_text" && partType != "text") {
+				a.hasContent = true
+			}
+		}
+	}
+}
+
+func (a *emptyCompletionAccum) evalInteractions(data []byte) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return false
+	}
+
+	var evType string
+	if raw := probe["event_type"]; raw != nil {
+		_ = json.Unmarshal(raw, &evType)
+	}
+	if evType == "" {
+		if raw := probe["type"]; raw != nil {
+			_ = json.Unmarshal(raw, &evType)
+		}
+	}
+
+	var objName string
+	if raw := probe["object"]; raw != nil {
+		_ = json.Unmarshal(raw, &objName)
+	}
+
+	isInteractions := objName == "interaction" ||
+		interactionsEventTypes[evType] ||
+		hasJSONKey(data, "interaction") ||
+		(hasJSONKey(data, "steps") && (hasJSONKey(data, "status") || hasJSONKey(data, "interaction_id")))
+
+	if !isInteractions {
+		return false
+	}
+
+	a.recognized = true
+	a.sawMessageData = true
+
+	var chunk interactionsChunk
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return true
+	}
+
+	status := chunk.Status
+	if chunk.Interaction != nil && chunk.Interaction.Status != "" {
+		status = chunk.Interaction.Status
+	}
+
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "completed":
+		a.terminal = true
+		a.interactionsTerminal = true
+	case "failed", "cancelled", "error", "blocked", "incomplete":
+		a.terminal = true
+		a.blocked = true
+	case "requires_action":
+		a.terminal = true
+		a.blocked = true
+	}
+
+	if evType == "interaction.completed" {
+		a.terminal = true
+		if !a.blocked {
+			a.interactionsTerminal = true
+		}
+	} else if evType == "finish" {
+		// The Interactions protocol ends a turn with a bare "finish" event whose
+		// usage lives under metadata.total_usage instead of the top-level usage
+		// field the other terminal events carry.
+		a.terminal = true
+		if !a.blocked {
+			a.interactionsTerminal = true
+		}
+		if chunk.Metadata != nil {
+			if chunk.Metadata.TotalUsage != nil {
+				a.evalInteractionsUsage(chunk.Metadata.TotalUsage)
+			} else {
+				a.evalInteractionsUsage(chunk.Metadata.Usage)
+			}
+		}
+	} else if evType == "interaction.failed" {
+		a.terminal = true
+		a.blocked = true
+	}
+
+	a.evalInteractionsUsage(chunk.Usage)
+	if chunk.Interaction != nil {
+		a.evalInteractionsUsage(chunk.Interaction.Usage)
+	}
+
+	if len(chunk.Steps) == 0 && chunk.Interaction != nil {
+		a.evalInteractionsSteps(chunk.Interaction.Steps)
+	} else {
+		a.evalInteractionsSteps(chunk.Steps)
+	}
+	if chunk.Step != nil {
+		a.evalInteractionsSteps([]interactionsStep{*chunk.Step})
+	}
+
+	if chunk.Delta != nil {
+		if strings.TrimSpace(chunk.Delta.Text) != "" ||
+			strings.TrimSpace(chunk.Delta.Data) != "" ||
+			strings.TrimSpace(chunk.Delta.FileURI) != "" ||
+			strings.TrimSpace(chunk.Delta.FileUri) != "" ||
+			strings.TrimSpace(chunk.Delta.URL) != "" {
+			a.hasContent = true
+		}
+		if chunk.Delta.Content != nil && chunk.Delta.Content.hasMeaningfulContent() {
+			a.hasContent = true
+		}
+		if strings.TrimSpace(chunk.Delta.Name) != "" || hasMeaningfulInteractionsArguments(chunk.Delta.Arguments) {
+			a.hasToolCalls = true
+		}
+		if nonEmptyJSONPayload(chunk.Delta.Result) {
+			a.hasContent = true
+		}
+	}
+
+	return true
+}
+
+func (a *emptyCompletionAccum) evalInteractionsUsage(usage *interactionsUsage) {
+	if usage == nil {
+		return
+	}
+	if usage.OutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*usage.OutputTokens)
+	}
+	if usage.TotalOutputTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*usage.TotalOutputTokens)
+	}
+	if usage.CompletionTokens != nil {
+		a.sawUsage = true
+		a.addUsage(*usage.CompletionTokens)
+	}
+}
+
+func (a *emptyCompletionAccum) evalInteractionsSteps(steps []interactionsStep) {
+	for _, step := range steps {
+		stepType := strings.ToLower(strings.TrimSpace(step.Type))
+		switch stepType {
+		case "function_call":
+			if strings.TrimSpace(step.Name) != "" || hasMeaningfulInteractionsArguments(step.Arguments) {
+				a.hasToolCalls = true
+			}
+		case "function_result":
+			if strings.TrimSpace(step.Name) != "" || nonEmptyJSONPayload(step.Result) {
+				a.hasContent = true
+			}
+		default:
+			if strings.TrimSpace(step.Name) != "" || hasMeaningfulInteractionsArguments(step.Arguments) {
+				a.hasToolCalls = true
+			}
+			if nonEmptyJSONPayload(step.Result) {
+				a.hasContent = true
+			}
+		}
+		for _, content := range step.Content {
+			if content.hasMeaningfulContent() {
+				a.hasContent = true
+			}
+		}
+	}
+}
+
 // hasJSONKey reports whether the given JSON object contains name as a top-level
 // key. It returns false for non-object or malformed input.
 func hasJSONKey(data []byte, name string) bool {
@@ -1195,7 +1835,7 @@ func (s *streamBootstrapState) isTerminalEmpty() bool {
 		// frame; do not judge the stream empty until usage arrives.
 		return false
 	}
-	return (s.sawDone || s.acc.openAITerminal || s.acc.claudeTerminal || s.acc.geminiTerminal) && s.isEmptyCompletion()
+	return (s.sawDone || s.acc.openAITerminal || s.acc.claudeTerminal || s.acc.geminiTerminal || s.acc.interactionsTerminal) && s.isEmptyCompletion()
 }
 
 // setExpectedChoices tells the state how many choices the request asked for, so

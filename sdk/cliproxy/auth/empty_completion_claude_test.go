@@ -28,7 +28,7 @@ func TestIsEmptyCompletionPayloadClaude(t *testing.T) {
 		{name: "thinking with text", payload: []byte(`{"type":"message","content":[{"type":"thinking","thinking":"let me think"}],"stop_reason":"end_turn"}`), expected: false},
 		{name: "sse max_tokens", payload: []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), expected: false},
 		{name: "gemini text still not empty", payload: []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}`), expected: false},
-		{name: "responses completed still unrecognized", payload: []byte(`{"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"output_tokens":0}}}`), expected: false},
+		{name: "responses completed never empty by contract", payload: []byte(`{"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"output_tokens":0}}}`), expected: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,8 +47,8 @@ func TestClaudeFormatRecognizedAndSiblingsUntouched(t *testing.T) {
 	}
 
 	var responses emptyCompletionAccum
-	if responses.evalJSON([]byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)) || responses.recognized {
-		t.Fatal("Responses must stay unrecognized in this slice")
+	if !responses.evalJSON([]byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)) || !responses.recognized {
+		t.Fatal("Responses completed must be recognized")
 	}
 }
 

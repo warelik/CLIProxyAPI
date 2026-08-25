@@ -223,6 +223,7 @@ func forceMappingStreamUpstreamChunks(provider, upstreamModel string) [][]byte {
 	default:
 		return [][]byte{
 			[]byte(`data: {"type":"response.created","response":{"model":"` + upstreamModel + `"}}` + "\n\n"),
+			[]byte(`data: {"type":"response.completed","response":{"model":"` + upstreamModel + `","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}}` + "\n\n"),
 		}
 	}
 }

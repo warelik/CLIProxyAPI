@@ -31,7 +31,7 @@ func TestIsEmptyCompletionPayloadGemini(t *testing.T) {
 		{name: "thoughtSignature with positive tokens", payload: []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"","thoughtSignature":"sig"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1}}`), expected: false},
 		{name: "SAFETY empty parts", payload: []byte(`{"candidates":[{"content":{"parts":[]},"finishReason":"SAFETY"}]}`), expected: false},
 		{name: "MAX_TOKENS empty parts", payload: []byte(`{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}`), expected: false},
-		{name: "responses completed still unrecognized", payload: []byte(`{"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"output_tokens":0}}}`), expected: false},
+		{name: "responses completed never empty by contract", payload: []byte(`{"type":"response.completed","response":{"id":"r","status":"completed","output":[],"usage":{"output_tokens":0}}}`), expected: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,8 +55,8 @@ func TestGeminiFormatRecognizedAndSiblingsUntouched(t *testing.T) {
 	}
 
 	var responses emptyCompletionAccum
-	if responses.evalJSON([]byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)) || responses.recognized {
-		t.Fatal("Responses must stay unrecognized in this slice")
+	if !responses.evalJSON([]byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)) || !responses.recognized {
+		t.Fatal("Responses completed must be recognized")
 	}
 }
 

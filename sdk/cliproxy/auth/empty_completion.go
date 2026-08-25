@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
 	"strings"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // tokenCount is a tolerant usage count that accepts any valid JSON number
@@ -64,6 +67,12 @@ var errEmptyCompletion = &Error{
 	Retryable:  true,
 	HTTPStatus: http.StatusServiceUnavailable,
 }
+
+// maxStreamBootstrapBytes caps how much of a stream prefix the bootstrap
+// detector buffers before it gives up and forwards. It bounds memory per
+// in-flight stream and keeps a long metadata preamble from delaying the
+// client's first byte indefinitely.
+const maxStreamBootstrapBytes = 1 << 20
 
 // openAIChunk is the minimal OpenAI-style SSE/JSON shape used to detect empty
 // completions.
@@ -433,6 +442,413 @@ func (a *emptyCompletionAccum) empty() bool {
 		return true
 	}
 	return false
+}
+
+// isEmptyCompletion reports whether the buffered stream prefix aggregates to an
+// empty completion. The prefix is replayed through a fresh state and finalized,
+// so a trailing frame that was never closed by a blank separator line is still
+// judged instead of silently passing as output.
+func isEmptyCompletion(chunks []cliproxyexecutor.StreamChunk) bool {
+	if len(chunks) == 0 {
+		return false
+	}
+	var state streamBootstrapState
+	for _, c := range chunks {
+		if state.observe(c.Payload) {
+			return false
+		}
+	}
+	state.finish()
+	return state.isEmptyCompletion()
+}
+
+// streamBootstrapState incrementally evaluates stream chunks so a metadata-heavy
+// prefix is processed once instead of reparsing the whole prefix per chunk. The
+// streaming path cannot wait for a complete body: forward-or-rotate has to be
+// decided on the prefix, so the state tracks just enough to answer two
+// questions - is there meaningful output yet (forward), and has the stream
+// already reached a terminal marker with nothing in it (rotate).
+type streamBootstrapState struct {
+	acc       emptyCompletionAccum
+	bytes     int
+	pending   []byte
+	dataLines [][]byte
+	forward   bool
+	sawSSE    bool
+	sawDone   bool
+}
+
+func (s *streamBootstrapState) flushData() {
+	if len(s.dataLines) == 0 {
+		return
+	}
+	data := bytes.Join(s.dataLines, []byte("\n"))
+	s.dataLines = s.dataLines[:0]
+	if bytes.Equal(data, []byte("[DONE]")) {
+		s.acc.recognized = true
+		s.acc.terminal = true
+		s.acc.sawMessageData = true
+		s.sawDone = true
+		return
+	}
+	if len(data) == 0 {
+		s.acc.sawMetadataOnly = true
+		return
+	}
+	if !s.acc.evalJSON(data) {
+		s.acc.sawUnknownData = true
+	}
+}
+
+func (s *streamBootstrapState) processLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 {
+		if len(s.dataLines) > 0 && classifyJSONBuffer(bytes.Join(s.dataLines, []byte("\n"))) == jsonBufIncomplete {
+			// Pretty-printed raw JSON may contain blank lines; keep them in the
+			// buffer and do not treat them as an SSE event boundary.
+			s.dataLines = append(s.dataLines, []byte(""))
+			return
+		}
+		s.flushData()
+		return
+	}
+	s.processSingleLine(line)
+}
+
+func (s *streamBootstrapState) processSingleLine(line []byte) {
+	switch {
+	case bytes.HasPrefix(line, []byte("event:")):
+		s.sawSSE = true
+		if bytes.Equal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:"))), []byte("message_stop")) {
+			s.acc.recognized = true
+			s.acc.terminal = true
+			s.acc.sawMessageData = true
+			s.sawDone = true
+		} else {
+			s.acc.sawMetadataOnly = true
+		}
+	case bytes.Equal(line, []byte("event")):
+		s.sawSSE = true
+		s.acc.sawMetadataOnly = true
+	case bytes.HasPrefix(line, []byte("id:")), bytes.HasPrefix(line, []byte("retry:")), bytes.HasPrefix(line, []byte(":")):
+		s.sawSSE = true
+		s.acc.sawMetadataOnly = true
+	case bytes.Equal(line, []byte("id")), bytes.Equal(line, []byte("retry")):
+		s.sawSSE = true
+		s.acc.sawMetadataOnly = true
+	case bytes.HasPrefix(line, []byte("data:")):
+		s.sawSSE = true
+		s.dataLines = append(s.dataLines, parseSSEDataLine(line))
+	case bytes.Equal(line, []byte("data")):
+		s.sawSSE = true
+		s.dataLines = append(s.dataLines, []byte(""))
+	case bytes.HasPrefix(line, []byte("{")), bytes.HasPrefix(line, []byte("[")):
+		s.sawSSE = true
+		// Raw JSONL/NDJSON frames are newline-terminated and never followed by a
+		// blank separator line, so buffering them would defer evaluation until
+		// the bootstrap byte cap is hit. Evaluate a self-contained frame
+		// immediately; keep buffering only when a multi-line JSON value is
+		// already in progress.
+		if len(s.dataLines) == 0 && classifyJSONBuffer(line) == jsonBufComplete {
+			if !s.acc.evalJSON(line) {
+				s.acc.sawUnknownData = true
+			}
+			return
+		}
+		s.dataLines = append(s.dataLines, line)
+	default:
+		// A pretty-printed raw JSON frame arrives one line at a time: the
+		// opening brace lands in dataLines and every continuation line looks
+		// like an isolated, invalid JSON value on its own. Append the line
+		// first, then classify the joined buffer; evaluate as soon as it
+		// becomes complete instead of waiting for a blank line that may never
+		// come.
+		if len(s.dataLines) > 0 {
+			s.dataLines = append(s.dataLines, line)
+			joined := bytes.Join(s.dataLines, []byte("\n"))
+			s.dataLines = s.dataLines[:0]
+			switch classifyJSONBuffer(joined) {
+			case jsonBufComplete:
+				if !s.acc.evalJSON(joined) {
+					s.acc.sawUnknownData = true
+				}
+			case jsonBufIncomplete:
+				// Still incomplete; restore the accumulated lines and wait for
+				// the next continuation.
+				s.dataLines = append([][]byte(nil), joined)
+			default:
+				s.acc.sawUnknownData = true
+			}
+			return
+		}
+		if classify := classifyJSONBuffer(line); classify == jsonBufComplete || classify == jsonBufIncomplete {
+			if !s.acc.evalJSON(line) {
+				s.acc.sawUnknownData = true
+			}
+		} else {
+			s.acc.sawUnknownData = true
+		}
+	}
+}
+
+// observe folds the next chunk into the state and reports whether the stream
+// must be forwarded to the client from here on. Once it returns true the state
+// stops inspecting: meaningful output has been seen and no later frame can turn
+// the response back into an empty completion.
+func (s *streamBootstrapState) observe(fragment []byte) bool {
+	if s.forward {
+		return true
+	}
+	s.bytes += len(fragment)
+	if s.bytes > maxStreamBootstrapBytes {
+		// A prefix this long is not a metadata preamble. Stop buffering and let
+		// the stream through rather than holding the client's first byte back.
+		s.forward = true
+		return true
+	}
+	s.pending = append(s.pending, fragment...)
+	for {
+		newline := bytes.IndexByte(s.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := bytes.TrimSpace(s.pending[:newline])
+		s.pending = s.pending[newline+1:]
+		s.processLine(line)
+		if s.shouldForward() {
+			s.forward = true
+			return true
+		}
+	}
+
+	trimmed := bytes.TrimSpace(s.pending)
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		payload := bytes.TrimSpace(trimmed[len("data:"):])
+		if len(s.dataLines) == 0 && (bytes.Equal(payload, []byte("[DONE]")) || classifyJSONBuffer(payload) == jsonBufComplete) {
+			// A complete data frame that arrived without its trailing newline:
+			// evaluate it now, otherwise a provider that omits the final blank
+			// line keeps the terminal marker invisible until EOF.
+			s.sawSSE = true
+			s.dataLines = append(s.dataLines, parseSSEDataLine(trimmed))
+			s.flushData()
+			s.pending = s.pending[:0]
+			s.forward = s.shouldForward()
+			return s.forward
+		}
+		return false
+	}
+
+	if couldBeSSEPrefix(trimmed) {
+		return false
+	}
+	switch classifyJSONBuffer(trimmed) {
+	case jsonBufComplete:
+		if !s.acc.evalJSON(trimmed) {
+			s.acc.sawUnknownData = true
+		}
+		s.pending = s.pending[:0]
+	case jsonBufEmpty, jsonBufIncomplete:
+		return false
+	case jsonBufInvalid:
+		s.acc.sawUnknownData = true
+	}
+	s.forward = s.shouldForward()
+	return s.forward
+}
+
+// finish flushes whatever is still buffered. A provider may close the stream
+// right after the last frame without the blank separator line, and only this
+// call turns that tail into a verdict.
+func (s *streamBootstrapState) finish() {
+	if len(s.pending) > 0 {
+		trimmed := bytes.TrimSpace(s.pending)
+		s.pending = s.pending[:0]
+		if len(trimmed) > 0 {
+			s.processLine(trimmed)
+		}
+	}
+	s.flushData()
+}
+
+// isEmptyCompletion reports the verdict for the observed prefix. A prefix that
+// produced no frame this slice can read is never empty: the streaming detector
+// only knows OpenAI chat completions, and a Responses/Claude/Gemini stream - or
+// one whose framing it failed to split into lines at all - must pass through
+// untouched rather than be buried as an empty completion.
+func (s *streamBootstrapState) isEmptyCompletion() bool {
+	if !s.acc.recognized {
+		return false
+	}
+	return s.acc.empty()
+}
+
+// isTerminalEmpty reports whether the prefix already reached a terminal marker
+// with nothing meaningful in it, so the conductor can stop reading and rotate
+// instead of waiting for a close that a stalled upstream may never send.
+func (s *streamBootstrapState) isTerminalEmpty() bool {
+	if s.acc.openAITerminal && !s.acc.sawUsage {
+		// OpenAI streams may emit finish_reason=stop before the final usage
+		// frame; do not judge the stream empty until usage arrives.
+		return false
+	}
+	return (s.sawDone || s.acc.openAITerminal) && s.isEmptyCompletion()
+}
+
+// setExpectedChoices tells the state how many choices the request asked for, so
+// a stream is not judged terminal after the first choice finishes while the
+// remaining ones are still to come.
+func (s *streamBootstrapState) setExpectedChoices(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	s.acc.expectedChoices = n
+}
+
+// hasMeaningfulOutput reports whether the prefix already holds bytes the client
+// would lose. It is deliberately more permissive than shouldForward: holding a
+// prefix back is a detection decision, and it must not silently reclassify an
+// error that arrives mid-answer into a bootstrap failure the conductor would
+// retry on another credential.
+func (s *streamBootstrapState) hasMeaningfulOutput() bool {
+	if s.forward {
+		return true
+	}
+	if s.acc.hasContent || s.acc.hasToolCalls || s.acc.blocked ||
+		(s.acc.sawUsage && s.acc.completionTokens > 0) || s.acc.sawUnknownData {
+		return true
+	}
+	// Bytes that matched no protocol frame at all are opaque output as far as
+	// this detector is concerned; only a recognized or SSE-framed prefix is
+	// safe to treat as "nothing was delivered yet".
+	return !s.acc.recognized && !s.sawSSE && s.bytes > 0
+}
+
+func (s *streamBootstrapState) shouldForward() bool {
+	return s.acc.hasContent || s.acc.hasToolCalls || s.acc.blocked ||
+		(s.acc.sawUsage && s.acc.completionTokens > 0) || s.acc.sawUnknownData ||
+		(!s.acc.recognized && !s.sawSSE)
+}
+
+type jsonBufferStatus int
+
+const (
+	jsonBufEmpty jsonBufferStatus = iota
+	jsonBufComplete
+	jsonBufIncomplete
+	jsonBufInvalid
+)
+
+// classifyJSONBuffer classifies an accumulated raw-JSON stream tail as holding
+// one or more complete values (jsonBufComplete), a truncated prefix of a value
+// (jsonBufIncomplete), malformed or trailing garbage (jsonBufInvalid), or no
+// value (jsonBufEmpty). It inspects only the given buffer, so it can be called
+// again on each growing chunk without keeping a persistent decoder.
+func classifyJSONBuffer(buf []byte) jsonBufferStatus {
+	if hasTruncatedUTF8Suffix(buf) {
+		return jsonBufIncomplete
+	}
+	dec := json.NewDecoder(bytes.NewReader(buf))
+	count := 0
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			if err == io.EOF {
+				if count == 0 {
+					return jsonBufEmpty
+				}
+				return jsonBufComplete
+			}
+			if isTruncatedJSON(err) {
+				return jsonBufIncomplete
+			}
+			return jsonBufInvalid
+		}
+		count++
+	}
+}
+
+// isTruncatedJSON reports whether a json decoding error is caused by the input
+// ending mid-value (a truncated prefix) rather than by malformed contents.
+func isTruncatedJSON(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var syn *json.SyntaxError
+	if errors.As(err, &syn) {
+		return strings.Contains(syn.Error(), "unexpected end of JSON input")
+	}
+	return false
+}
+
+// hasTruncatedUTF8Suffix reports whether buf ends in the middle of a multi-byte
+// UTF-8 sequence, which happens when a raw JSON value is split at a chunk
+// boundary inside a string literal.
+func hasTruncatedUTF8Suffix(buf []byte) bool {
+	n := len(buf)
+	if n == 0 {
+		return false
+	}
+	i := n - 1
+	for i >= 0 && buf[i]&0xC0 == 0x80 {
+		i--
+	}
+	if i < 0 {
+		return false
+	}
+	lead := buf[i]
+	var need int
+	switch {
+	case lead&0xE0 == 0xC0:
+		need = 1
+	case lead&0xF0 == 0xE0:
+		need = 2
+	case lead&0xF8 == 0xF0:
+		need = 3
+	default:
+		return false
+	}
+	return n-i-1 < need
+}
+
+// couldBeSSEPrefix reports whether the buffered tail may still grow into an SSE
+// field line, so a chunk boundary inside "eve|nt: foo" is not mistaken for
+// unknown data.
+func couldBeSSEPrefix(payload []byte) bool {
+	const dataPrefix = "data:"
+	const eventPrefix = "event:"
+	const idPrefix = "id:"
+	const retryPrefix = "retry:"
+	value := string(payload)
+	return strings.HasPrefix(value, ":") ||
+		strings.HasPrefix(dataPrefix, value) || strings.HasPrefix(eventPrefix, value) ||
+		strings.HasPrefix(idPrefix, value) || strings.HasPrefix(retryPrefix, value) ||
+		strings.HasPrefix(value, dataPrefix) || strings.HasPrefix(value, eventPrefix) ||
+		strings.HasPrefix(value, idPrefix) || strings.HasPrefix(value, retryPrefix) ||
+		value == "data" || value == "event" || value == "id" || value == "retry"
+}
+
+// extractExpectedChoices reports how many OpenAI choices the request asked for
+// (top-level "n"). Without it a two-choice stream whose first choice finishes
+// empty looks terminal while the second choice is still to come, and a live
+// credential is rotated away. Anything unparseable or absent means one choice.
+func extractExpectedChoices(payload []byte) int {
+	if len(payload) == 0 {
+		return 1
+	}
+	var req struct {
+		N *int `json:"n"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return 1
+	}
+	if req.N != nil && *req.N > 1 {
+		return *req.N
+	}
+	return 1
 }
 
 // isEmptyCompletionPayload reports whether a payload (aggregated SSE chunks or

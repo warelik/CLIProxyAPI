@@ -177,6 +177,55 @@ func TestWrapStreamResultRedactsInBandErrorPayload(t *testing.T) {
 	}
 }
 
+// TestWrapStreamResultRedactsSplitInBandErrorPayload verifies that an in-band
+// provider error split across multiple chunks after meaningful output is buffered
+// until the complete frame is recognized, then emitted as a single redacted
+// aggregate; no fragment of the credential reaches the caller.
+func TestWrapStreamResultRedactsSplitInBandErrorPayload(t *testing.T) {
+	const model = "inband-split-leak-model"
+	const secret = "sk-live-split-secret"
+	auth := &Auth{ID: "inband-split-leak-auth", Provider: "stream-inband-leak", Status: StatusActive}
+
+	exec := &streamInBandLeakExecutor{chunks: []cliproxyexecutor.StreamChunk{
+		{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n")},
+		{Payload: []byte(`data: {"error":{"message":"Incorrect API key provided: ` + secret[:3])},
+		{Payload: []byte(secret[3:] + `","type":"invalid_request_error"}}` + "\n\n")},
+	}}
+
+	m := NewManager(nil, nil, nil)
+	m.RegisterExecutor(exec)
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "stream-inband-leak", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	stream, errStream := m.ExecuteStream(context.Background(), []string{"stream-inband-leak"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() unexpected error = %v", errStream)
+	}
+
+	var payloads []string
+	for chunk := range stream.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloads = append(payloads, string(chunk.Payload))
+		}
+	}
+	joined := strings.Join(payloads, "")
+	if strings.Contains(joined, secret) {
+		t.Fatalf("caller-visible stream payload leaks split in-band credential: %q", joined)
+	}
+	if !strings.Contains(joined, "hello") {
+		t.Fatalf("meaningful content was dropped: %q", joined)
+	}
+	if !strings.Contains(joined, "REDACTED") {
+		t.Fatalf("split in-band error payload was not redacted: %q", joined)
+	}
+}
+
 func TestDiscardStreamChunksExitsOnContextCancel(t *testing.T) {
 	src := make(chan cliproxyexecutor.StreamChunk)
 	ctx, cancel := context.WithCancel(context.Background())

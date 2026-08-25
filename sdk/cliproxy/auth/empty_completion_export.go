@@ -207,3 +207,28 @@ func (d *StreamPayloadErrorDetector) Finish() error {
 	}
 	return nil
 }
+
+// HasPending reports whether the detector is holding an incomplete frame (a
+// partial SSE line, a data line without a closing blank line, or an incomplete
+// JSON fragment). Callers can use this to avoid forwarding trailing fragments
+// that belong to a frame already in flight.
+func (d *StreamPayloadErrorDetector) HasPending() bool {
+	if d == nil {
+		return false
+	}
+	return d.state.HasPending()
+}
+
+// TakeFrame reports a completed frame from the most recent Observe/Finish call.
+// The returned error is non-nil when the completed frame was an in-band provider
+// error; the bool is true when a frame was consumed.
+func (d *StreamPayloadErrorDetector) TakeFrame() (error, bool) {
+	if d == nil {
+		return nil, false
+	}
+	err, ok := d.state.TakeFrame()
+	if err != nil {
+		return err, ok
+	}
+	return nil, ok
+}

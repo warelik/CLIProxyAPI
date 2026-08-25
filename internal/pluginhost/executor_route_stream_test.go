@@ -413,3 +413,30 @@ func TestWrapStreamEmptyCompletionRedactsInBandErrorPayload(t *testing.T) {
 		t.Fatalf("in-band error payload was not redacted: %q", joined)
 	}
 }
+
+func TestWrapStreamEmptyCompletionRedactsSplitInBandErrorPayload(t *testing.T) {
+	const secret = "sk-live-split-plugin-secret"
+	src := make(chan coreexecutor.StreamChunk, 3)
+	src <- coreexecutor.StreamChunk{Payload: []byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n")}
+	src <- coreexecutor.StreamChunk{Payload: []byte(`data: {"error":{"message":"Incorrect API key provided: ` + secret[:3])}
+	src <- coreexecutor.StreamChunk{Payload: []byte(secret[3:] + `","type":"invalid_request_error"}}` + "\n\n")}
+	close(src)
+
+	wrapped := wrapStreamEmptyCompletion(context.Background(), &coreexecutor.StreamResult{Chunks: src})
+	var payloads []string
+	for chunk := range wrapped.Chunks {
+		if len(chunk.Payload) > 0 {
+			payloads = append(payloads, string(chunk.Payload))
+		}
+	}
+	joined := strings.Join(payloads, "")
+	if strings.Contains(joined, secret) {
+		t.Fatalf("plugin stream payload leaks split in-band credential: %q", joined)
+	}
+	if !strings.Contains(joined, "hello") {
+		t.Fatalf("meaningful content was dropped: %q", joined)
+	}
+	if !strings.Contains(joined, "REDACTED") {
+		t.Fatalf("split in-band error payload was not redacted: %q", joined)
+	}
+}

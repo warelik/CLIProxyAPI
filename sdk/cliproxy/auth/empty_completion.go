@@ -8,8 +8,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -737,7 +739,11 @@ func (a *emptyCompletionAccum) evalJSON(data []byte) bool {
 	}
 	recognized := false
 	for _, v := range values {
-		if a.evalOpenAI(v) || a.evalClaude(v) || a.evalOpenAIResponse(v) || a.evalGemini(v) || a.evalInteractions(v) {
+		if evalProviderError(v, "") != nil {
+			recognized = true
+			a.blocked = true
+			a.terminal = true
+		} else if a.evalOpenAI(v) || a.evalClaude(v) || a.evalOpenAIResponse(v) || a.evalGemini(v) || a.evalInteractions(v) {
 			recognized = true
 		} else {
 			a.sawUnknownData = true
@@ -1608,21 +1614,33 @@ func isEmptyCompletion(chunks []cliproxyexecutor.StreamChunk) bool {
 // questions - is there meaningful output yet (forward), and has the stream
 // already reached a terminal marker with nothing in it (rotate).
 type streamBootstrapState struct {
-	acc       emptyCompletionAccum
-	bytes     int
-	pending   []byte
-	dataLines [][]byte
-	forward   bool
-	sawSSE    bool
-	sawDone   bool
+	acc          emptyCompletionAccum
+	bytes        int
+	pending      []byte
+	dataLines    [][]byte
+	forward      bool
+	sawSSE       bool
+	sawDone      bool
+	currentEvent string
+	streamErr    *Error
+}
+
+func (s *streamBootstrapState) streamError() error {
+	if s == nil || s.streamErr == nil {
+		return nil
+	}
+	return s.streamErr
 }
 
 func (s *streamBootstrapState) flushData() {
 	if len(s.dataLines) == 0 {
+		s.currentEvent = ""
 		return
 	}
 	data := bytes.Join(s.dataLines, []byte("\n"))
 	s.dataLines = s.dataLines[:0]
+	currentEvent := s.currentEvent
+	s.currentEvent = ""
 	if bytes.Equal(data, []byte("[DONE]")) {
 		s.acc.recognized = true
 		s.acc.terminal = true
@@ -1631,7 +1649,13 @@ func (s *streamBootstrapState) flushData() {
 		return
 	}
 	if len(data) == 0 {
-		s.acc.sawMetadataOnly = true
+		if currentEvent != "error" {
+			s.acc.sawMetadataOnly = true
+		}
+		return
+	}
+	if err := evalProviderError(data, currentEvent); err != nil {
+		s.streamErr = err
 		return
 	}
 	if !s.acc.evalJSON(data) {
@@ -1658,11 +1682,15 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 	switch {
 	case bytes.HasPrefix(line, []byte("event:")):
 		s.sawSSE = true
-		if bytes.Equal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("event:"))), []byte("message_stop")) {
+		event := strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+		s.currentEvent = event
+		if event == "message_stop" {
 			s.acc.recognized = true
 			s.acc.terminal = true
 			s.acc.sawMessageData = true
 			s.sawDone = true
+		} else if event == "error" {
+			// Do not mark metadata-only as a success signal on an error event.
 		} else {
 			s.acc.sawMetadataOnly = true
 		}
@@ -1689,7 +1717,9 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 		// immediately; keep buffering only when a multi-line JSON value is
 		// already in progress.
 		if len(s.dataLines) == 0 && classifyJSONBuffer(line) == jsonBufComplete {
-			if !s.acc.evalJSON(line) {
+			if err := evalProviderError(line, ""); err != nil {
+				s.streamErr = err
+			} else if !s.acc.evalJSON(line) {
 				s.acc.sawUnknownData = true
 			}
 			return
@@ -1708,7 +1738,9 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 			s.dataLines = s.dataLines[:0]
 			switch classifyJSONBuffer(joined) {
 			case jsonBufComplete:
-				if !s.acc.evalJSON(joined) {
+				if err := evalProviderError(joined, ""); err != nil {
+					s.streamErr = err
+				} else if !s.acc.evalJSON(joined) {
 					s.acc.sawUnknownData = true
 				}
 			case jsonBufIncomplete:
@@ -1721,7 +1753,9 @@ func (s *streamBootstrapState) processSingleLine(line []byte) {
 			return
 		}
 		if classify := classifyJSONBuffer(line); classify == jsonBufComplete || classify == jsonBufIncomplete {
-			if !s.acc.evalJSON(line) {
+			if err := evalProviderError(line, ""); err != nil {
+				s.streamErr = err
+			} else if !s.acc.evalJSON(line) {
 				s.acc.sawUnknownData = true
 			}
 		} else {
@@ -1786,7 +1820,9 @@ func (s *streamBootstrapState) observe(fragment []byte) bool {
 	}
 	switch classifyJSONBuffer(trimmed) {
 	case jsonBufComplete:
-		if !s.acc.evalJSON(trimmed) {
+		if err := evalProviderError(trimmed, ""); err != nil {
+			s.streamErr = err
+		} else if !s.acc.evalJSON(trimmed) {
 			s.acc.sawUnknownData = true
 		}
 		s.pending = s.pending[:0]
@@ -1861,6 +1897,9 @@ func (s *streamBootstrapState) hasMeaningfulOutput() bool {
 		(s.acc.sawUsage && s.acc.completionTokens > 0) || s.acc.sawUnknownData {
 		return true
 	}
+	if s.streamErr != nil {
+		return false
+	}
 	// Bytes that matched no protocol frame at all are opaque output as far as
 	// this detector is concerned; only a recognized or SSE-framed prefix is
 	// safe to treat as "nothing was delivered yet".
@@ -1868,6 +1907,9 @@ func (s *streamBootstrapState) hasMeaningfulOutput() bool {
 }
 
 func (s *streamBootstrapState) shouldForward() bool {
+	if s.streamErr != nil {
+		return false
+	}
 	return s.acc.hasContent || s.acc.hasToolCalls || s.acc.blocked ||
 		(s.acc.sawUsage && s.acc.completionTokens > 0) || s.acc.sawUnknownData ||
 		(!s.acc.recognized && !s.sawSSE)
@@ -2119,6 +2161,427 @@ func isSSEPrefix(b []byte) bool {
 		bytes.Equal(b, []byte("event")) ||
 		bytes.Equal(b, []byte("id")) ||
 		bytes.Equal(b, []byte("retry"))
+}
+
+type streamErrorEnvelope struct {
+	Type        string               `json:"type"`
+	EventType   string               `json:"event_type"`
+	Error       json.RawMessage      `json:"error"`
+	Message     string               `json:"message"`
+	Code        json.RawMessage      `json:"code"`
+	Status      string               `json:"status"`
+	Response    *streamErrorEnvelope `json:"response,omitempty"`
+	Interaction *streamErrorEnvelope `json:"interaction,omitempty"`
+}
+
+func inferHTTPStatus(typeStr, codeStr, statusStr string) int {
+	if statusStr != "" {
+		switch strings.ToUpper(strings.TrimSpace(statusStr)) {
+		case "RESOURCE_EXHAUSTED":
+			return http.StatusTooManyRequests
+		case "UNAUTHENTICATED":
+			return http.StatusUnauthorized
+		case "PERMISSION_DENIED":
+			return http.StatusForbidden
+		case "UNAVAILABLE":
+			return http.StatusServiceUnavailable
+		case "DEADLINE_EXCEEDED":
+			return http.StatusGatewayTimeout
+		case "INTERNAL":
+			return http.StatusInternalServerError
+		case "INVALID_ARGUMENT", "FAILED_PRECONDITION":
+			return http.StatusBadRequest
+		case "NOT_FOUND":
+			return http.StatusNotFound
+		case "ALREADY_EXISTS":
+			return http.StatusConflict
+		}
+	}
+	for _, s := range []string{typeStr, codeStr} {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "overloaded_error", "overloaded":
+			return http.StatusServiceUnavailable
+		case "rate_limit_error", "rate_limit_exceeded", "insufficient_quota", "quota_exceeded", "requests":
+			return http.StatusTooManyRequests
+		case "authentication_error", "invalid_api_key", "unauthorized":
+			return http.StatusUnauthorized
+		case "permission_error", "forbidden":
+			return http.StatusForbidden
+		case "not_found_error":
+			return http.StatusNotFound
+		case "invalid_request_error", "bad_request_error", "invalid_prompt", "cyber_policy", "context_length_exceeded":
+			return http.StatusBadRequest
+		case "api_error", "internal_server_error":
+			return http.StatusInternalServerError
+		}
+	}
+	return 0
+}
+
+// isInteractionsFailureEnvelope reports whether an Interactions event carries a
+// provider failure. The failure detail is nested under "interaction", so without
+// this the stream is only marked blocked and the request never fails over.
+func isInteractionsFailureEnvelope(envelope streamErrorEnvelope) bool {
+	if strings.EqualFold(envelope.EventType, "interaction.failed") || strings.EqualFold(envelope.Type, "interaction.failed") {
+		return true
+	}
+	if envelope.Interaction == nil {
+		return false
+	}
+	if len(envelope.Interaction.Error) > 0 && !bytes.Equal(envelope.Interaction.Error, []byte("null")) {
+		return true
+	}
+	return strings.EqualFold(envelope.Interaction.Status, "failed")
+}
+
+func parseStreamErrorFromEnvelope(data []byte, envelope streamErrorEnvelope) *Error {
+	if envelope.Interaction != nil {
+		if (len(envelope.Error) == 0 || bytes.Equal(envelope.Error, []byte("null"))) && len(envelope.Interaction.Error) > 0 {
+			envelope.Error = envelope.Interaction.Error
+		}
+		if envelope.Message == "" {
+			envelope.Message = envelope.Interaction.Message
+		}
+		if len(envelope.Code) == 0 {
+			envelope.Code = envelope.Interaction.Code
+		}
+	}
+
+	if envelope.Response != nil {
+		if (len(envelope.Error) == 0 || bytes.Equal(envelope.Error, []byte("null"))) && len(envelope.Response.Error) > 0 {
+			envelope.Error = envelope.Response.Error
+		}
+		if envelope.Message == "" {
+			envelope.Message = envelope.Response.Message
+		}
+		if len(envelope.Code) == 0 {
+			envelope.Code = envelope.Response.Code
+		}
+		if envelope.Status == "" {
+			envelope.Status = envelope.Response.Status
+		}
+		if (envelope.Type == "" || strings.EqualFold(envelope.Type, "response.failed")) && envelope.Response.Type != "" {
+			envelope.Type = envelope.Response.Type
+		}
+	}
+
+	var detail struct {
+		Message string          `json:"message"`
+		Type    string          `json:"type"`
+		Code    json.RawMessage `json:"code"`
+		Status  string          `json:"status"`
+	}
+
+	var rawErrorString string
+	if len(envelope.Error) > 0 {
+		trimmedErr := bytes.TrimSpace(envelope.Error)
+		if bytes.HasPrefix(trimmedErr, []byte("{")) {
+			_ = json.Unmarshal(trimmedErr, &detail)
+		} else if bytes.HasPrefix(trimmedErr, []byte("\"")) {
+			_ = json.Unmarshal(trimmedErr, &rawErrorString)
+		}
+	}
+
+	message := detail.Message
+	if message == "" {
+		message = envelope.Message
+	}
+	if message == "" {
+		message = rawErrorString
+	}
+	if message == "" && detail.Type != "" {
+		message = detail.Type
+	}
+	if message == "" && detail.Status != "" {
+		message = detail.Status
+	}
+	if message == "" && len(data) > 0 && !bytes.HasPrefix(data, []byte("{")) {
+		message = string(data)
+	}
+	if message == "" {
+		message = "upstream stream error"
+	}
+
+	code := ""
+	var rawCodeInt int
+
+	extractCode := func(raw json.RawMessage) {
+		if len(raw) == 0 {
+			return
+		}
+		var strCode string
+		if json.Unmarshal(raw, &strCode) == nil && strings.TrimSpace(strCode) != "" {
+			code = strings.TrimSpace(strCode)
+			if num, err := strconv.Atoi(code); err == nil && num > 0 {
+				rawCodeInt = num
+			}
+			return
+		}
+		var num json.Number
+		if json.Unmarshal(raw, &num) == nil {
+			if n, err := num.Int64(); err == nil && n > 0 {
+				rawCodeInt = int(n)
+				code = strconv.Itoa(rawCodeInt)
+			}
+		}
+	}
+
+	extractCode(detail.Code)
+	if code == "" {
+		extractCode(envelope.Code)
+	}
+	if code == "" && detail.Type != "" {
+		code = detail.Type
+	}
+	if code == "" && detail.Status != "" {
+		code = detail.Status
+	}
+	if code == "" && envelope.Type != "" && !strings.EqualFold(envelope.Type, "error") {
+		code = envelope.Type
+	}
+
+	status := 0
+	if rawCodeInt >= 100 && rawCodeInt <= 599 {
+		status = rawCodeInt
+	}
+	statusStr := strings.TrimSpace(detail.Status)
+	if statusStr == "" {
+		statusStr = strings.TrimSpace(envelope.Status)
+	}
+	typeStr := strings.TrimSpace(detail.Type)
+	if typeStr == "" {
+		typeStr = strings.TrimSpace(envelope.Type)
+	}
+
+	if status == 0 {
+		status = inferHTTPStatus(typeStr, code, statusStr)
+	}
+
+	if status == 0 {
+		lowerMsg := strings.ToLower(message)
+		switch {
+		case strings.Contains(lowerMsg, "rate limit") || strings.Contains(lowerMsg, "resource exhausted") || strings.Contains(lowerMsg, "too many requests") || strings.Contains(lowerMsg, "quota"):
+			status = http.StatusTooManyRequests
+		case strings.Contains(lowerMsg, "overloaded"):
+			status = http.StatusServiceUnavailable
+		case strings.Contains(lowerMsg, "unauthorized") || strings.Contains(lowerMsg, "invalid api key") || strings.Contains(lowerMsg, "invalid x-api-key") || strings.Contains(lowerMsg, "unauthenticated"):
+			status = http.StatusUnauthorized
+		case strings.Contains(lowerMsg, "permission denied") || strings.Contains(lowerMsg, "forbidden"):
+			status = http.StatusForbidden
+		default:
+			status = http.StatusBadGateway
+		}
+	}
+
+	err := &Error{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: status,
+	}
+
+	if isRequestInvalidError(err) || clienterror.IsRequestFault(status, errors.New(string(data))) {
+		err.Retryable = false
+	} else {
+		err.Retryable = true
+	}
+
+	// Sanitize every text field before the parsed upstream error reaches
+	// logging, result recording, or the output stream.
+	return sanitizeErrorTextFields(err).(*Error)
+}
+
+func evalProviderError(data []byte, sseEvent string) *Error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil
+	}
+
+	var envelope streamErrorEnvelope
+	isError := strings.EqualFold(sseEvent, "error")
+
+	if bytes.HasPrefix(trimmed, []byte("{")) {
+		if err := json.Unmarshal(trimmed, &envelope); err == nil {
+			if len(envelope.Error) > 0 && !bytes.Equal(envelope.Error, []byte("null")) {
+				isError = true
+			} else if strings.EqualFold(envelope.Type, "error") || strings.EqualFold(envelope.Type, "response.failed") {
+				isError = true
+			} else if isInteractionsFailureEnvelope(envelope) {
+				isError = true
+			} else if envelope.Response != nil {
+				if len(envelope.Response.Error) > 0 && !bytes.Equal(envelope.Response.Error, []byte("null")) {
+					isError = true
+				} else if strings.EqualFold(envelope.Response.Type, "error") || strings.EqualFold(envelope.Response.Status, "failed") {
+					isError = true
+				}
+			}
+		}
+	}
+
+	if !isError {
+		return nil
+	}
+
+	return parseStreamErrorFromEnvelope(trimmed, envelope)
+}
+
+type streamPayloadErrorDetector struct {
+	pending      []byte
+	dataLines    [][]byte
+	currentEvent string
+	err          *Error
+}
+
+func (d *streamPayloadErrorDetector) Observe(chunk []byte) *Error {
+	if d.err != nil {
+		return d.err
+	}
+	if len(chunk) == 0 {
+		return nil
+	}
+	d.pending = append(d.pending, chunk...)
+	for {
+		newline := bytes.IndexByte(d.pending, '\n')
+		if newline < 0 {
+			break
+		}
+		line := bytes.TrimSpace(d.pending[:newline])
+		d.pending = d.pending[newline+1:]
+		if len(line) == 0 {
+			if len(d.dataLines) > 0 && classifyJSONBuffer(bytes.Join(d.dataLines, []byte("\n"))) == jsonBufIncomplete {
+				d.dataLines = append(d.dataLines, []byte(""))
+				continue
+			}
+			d.flushData()
+			if d.err != nil {
+				return d.err
+			}
+			continue
+		}
+		d.processLine(line)
+		if d.err != nil {
+			return d.err
+		}
+	}
+	trimmed := bytes.TrimSpace(d.pending)
+	if len(trimmed) > 0 && !isSSEPrefix(trimmed) && !couldBeSSEPrefix(trimmed) {
+		if classifyJSONBuffer(trimmed) == jsonBufComplete {
+			if values, err := decodeJSONValues(trimmed); err == nil {
+				for _, v := range values {
+					if streamErr := evalProviderError(v, ""); streamErr != nil {
+						d.err = streamErr
+						d.pending = d.pending[:0]
+						return d.err
+					}
+				}
+				d.pending = d.pending[:0]
+			}
+		}
+	}
+	return d.err
+}
+
+func (d *streamPayloadErrorDetector) processLine(line []byte) {
+	switch {
+	case bytes.HasPrefix(line, []byte("event:")):
+		d.currentEvent = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+	case bytes.Equal(line, []byte("event")):
+	case bytes.HasPrefix(line, []byte("id:")), bytes.HasPrefix(line, []byte("retry:")), bytes.HasPrefix(line, []byte(":")):
+	case bytes.Equal(line, []byte("id")), bytes.Equal(line, []byte("retry")):
+	case bytes.HasPrefix(line, []byte("data:")):
+		d.dataLines = append(d.dataLines, parseSSEDataLine(line))
+	case bytes.Equal(line, []byte("data")):
+		d.dataLines = append(d.dataLines, []byte(""))
+	case bytes.HasPrefix(line, []byte("{")), bytes.HasPrefix(line, []byte("[")):
+		// Same JSONL/NDJSON framing as the bootstrap detector: a self-contained
+		// frame is never followed by a blank line, so evaluate it now instead of
+		// buffering it until a separator that will not arrive.
+		if len(d.dataLines) == 0 && classifyJSONBuffer(line) == jsonBufComplete {
+			d.evalCompleteJSONLine(line)
+			return
+		}
+		d.dataLines = append(d.dataLines, line)
+	default:
+		// Mirror of the bootstrap detector: a pretty-printed raw JSON frame must
+		// append the closing line first, then classify the joined buffer, and
+		// evaluate immediately when it becomes complete.
+		if len(d.dataLines) > 0 {
+			d.dataLines = append(d.dataLines, line)
+			joined := bytes.Join(d.dataLines, []byte("\n"))
+			d.dataLines = nil
+			switch classifyJSONBuffer(joined) {
+			case jsonBufComplete:
+				d.evalCompleteJSONLine(joined)
+			case jsonBufIncomplete:
+				// Still incomplete; restore and wait for the next line.
+				d.dataLines = [][]byte{joined}
+			}
+			return
+		}
+		if classifyJSONBuffer(line) == jsonBufComplete {
+			d.evalCompleteJSONLine(line)
+		}
+	}
+}
+
+func (d *streamPayloadErrorDetector) evalCompleteJSONLine(line []byte) {
+	values, err := decodeJSONValues(line)
+	if err != nil {
+		if streamErr := evalProviderError(line, ""); streamErr != nil {
+			d.err = streamErr
+		}
+		return
+	}
+	for _, v := range values {
+		if streamErr := evalProviderError(v, ""); streamErr != nil {
+			d.err = streamErr
+			return
+		}
+	}
+}
+
+func (d *streamPayloadErrorDetector) flushData() {
+	if len(d.dataLines) == 0 {
+		return
+	}
+	data := bytes.Join(d.dataLines, []byte("\n"))
+	currentEvent := d.currentEvent
+	d.dataLines = nil
+	d.currentEvent = ""
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return
+	}
+	if len(data) == 0 {
+		return
+	}
+	if err := evalProviderError(data, currentEvent); err != nil {
+		d.err = err
+	}
+}
+
+func (d *streamPayloadErrorDetector) Finish() *Error {
+	if d.err != nil {
+		return d.err
+	}
+	if len(d.pending) > 0 {
+		trimmed := bytes.TrimSpace(d.pending)
+		d.pending = d.pending[:0]
+		if len(trimmed) > 0 {
+			if !isSSEPrefix(trimmed) && !couldBeSSEPrefix(trimmed) && classifyJSONBuffer(trimmed) == jsonBufComplete {
+				if values, err := decodeJSONValues(trimmed); err == nil {
+					for _, v := range values {
+						if err := evalProviderError(v, ""); err != nil {
+							d.err = err
+							return d.err
+						}
+					}
+				}
+			} else {
+				d.processLine(trimmed)
+			}
+		}
+	}
+	d.flushData()
+	return d.err
 }
 
 func (a *emptyCompletionAccum) evalSSE(payload []byte) {

@@ -117,8 +117,8 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 // instead of a clean stream end, mirroring the conductor's aggregate-at-close
 // judgment. Recognized protocol framing is buffered only until meaningful output
 // appears or the stream closes; unrecognized streams remain pass-through.
-// In-band error / redaction (parent StreamError, SanitizeError, RedactSecrets)
-// is S7 and is not wired here.
+// Detected in-band provider errors take priority over terminal emptiness and
+// are sanitized through the conductor's redaction mechanism.
 func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.StreamResult, requestPayloads ...[]byte) *coreexecutor.StreamResult {
 	if streamResult == nil || streamResult.Chunks == nil {
 		errChunks := make(chan coreexecutor.StreamChunk, 1)
@@ -150,7 +150,20 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 			}
 		}
 		forwarding := false
+		var payloadErrors coreauth.StreamPayloadErrorDetector
 		forward := func(chunk coreexecutor.StreamChunk) bool {
+			if chunk.Err != nil {
+				chunk.Err = coreauth.SanitizeError(chunk.Err)
+			}
+			errorPath := chunk.Err != nil || detector.StreamError() != nil
+			if len(chunk.Payload) > 0 {
+				if err := payloadErrors.Observe(chunk.Payload); err != nil {
+					errorPath = true
+				}
+				if errorPath {
+					chunk.Payload = []byte(coreauth.RedactSecrets(string(chunk.Payload)))
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return false
@@ -197,7 +210,14 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 					// Judge with the incremental detector state instead of re-parsing
 					// the concatenated payload: separately chunked SSE frames do not
 					// reassemble into valid input for the payload-level check.
+					// Finish() parses the trailing fragment, so a provider error that only
+					// lands in that final unterminated frame is not known until after it
+					// runs: consult StreamError() before reporting terminal emptiness.
 					terminalEmpty := detector.Finish()
+					if streamErr := detector.StreamError(); streamErr != nil {
+						_ = forward(coreexecutor.StreamChunk{Err: streamErr})
+						return
+					}
 					if terminalEmpty {
 						_ = forward(coreexecutor.StreamChunk{Err: coreauth.EmptyCompletionError()})
 						return
@@ -233,6 +253,11 @@ func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.S
 				if !flush() {
 					return
 				}
+			}
+			if streamErr := detector.StreamError(); streamErr != nil {
+				discardStreamChunks(ctx, src)
+				_ = forward(coreexecutor.StreamChunk{Err: streamErr})
+				return
 			}
 			if detector.IsTerminalEmpty() {
 				discardStreamChunks(ctx, src)

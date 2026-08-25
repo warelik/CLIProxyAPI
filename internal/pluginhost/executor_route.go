@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -88,7 +89,14 @@ func (h *Host) ExecutePluginExecutor(ctx context.Context, pluginID string, req c
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	return adapter.Execute(ctx, (*coreauth.Auth)(nil), req, opts)
+	resp, err := adapter.Execute(ctx, (*coreauth.Auth)(nil), req, opts)
+	if err != nil {
+		return coreexecutor.Response{}, err
+	}
+	if coreauth.IsEmptyCompletionPayload(resp.Payload) {
+		return coreexecutor.Response{}, coreauth.EmptyCompletionError()
+	}
+	return resp, nil
 }
 
 // ExecutePluginExecutorStream executes a streaming request with the named plugin executor without changing the requested model.
@@ -97,7 +105,202 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 	if errAdapter != nil {
 		return nil, errAdapter
 	}
-	return adapter.ExecuteStream(ctx, (*coreauth.Auth)(nil), req, opts)
+	streamResult, err := adapter.ExecuteStream(ctx, (*coreauth.Auth)(nil), req, opts)
+	if err != nil {
+		return nil, err
+	}
+	return wrapStreamEmptyCompletion(ctx, streamResult, req.Payload, opts.OriginalRequest), nil
+}
+
+// wrapStreamEmptyCompletion wraps a plugin stream so that a terminal but empty
+// completion (no content, no tool calls) surfaces as an empty-completion error
+// instead of a clean stream end, mirroring the conductor's aggregate-at-close
+// judgment. Recognized protocol framing is buffered only until meaningful output
+// appears or the stream closes; unrecognized streams remain pass-through.
+// In-band error / redaction (parent StreamError, SanitizeError, RedactSecrets)
+// is S7 and is not wired here.
+func wrapStreamEmptyCompletion(ctx context.Context, streamResult *coreexecutor.StreamResult, requestPayloads ...[]byte) *coreexecutor.StreamResult {
+	if streamResult == nil || streamResult.Chunks == nil {
+		errChunks := make(chan coreexecutor.StreamChunk, 1)
+		errChunks <- coreexecutor.StreamChunk{Err: &coreauth.Error{
+			Code:      "empty_stream",
+			Message:   "upstream stream has no source",
+			Retryable: true,
+		}}
+		close(errChunks)
+		wrapped := &coreexecutor.StreamResult{Chunks: errChunks}
+		if streamResult != nil {
+			wrapped.Headers = streamResult.Headers
+		}
+		return wrapped
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	src := streamResult.Chunks
+	wrapped := make(chan coreexecutor.StreamChunk)
+	go func() {
+		defer close(wrapped)
+		buffered := make([]coreexecutor.StreamChunk, 0, 1)
+		var detector coreauth.StreamBootstrapDetector
+		for _, p := range requestPayloads {
+			if n := coreauth.ExtractExpectedChoices(p); n > 1 {
+				detector.SetExpectedChoices(n)
+				break
+			}
+		}
+		forwarding := false
+		forward := func(chunk coreexecutor.StreamChunk) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case wrapped <- chunk:
+				return true
+			}
+		}
+		flush := func() bool {
+			for _, chunk := range buffered {
+				if !forward(chunk) {
+					return false
+				}
+			}
+			buffered = nil
+			return true
+		}
+
+		for {
+			var (
+				chunk coreexecutor.StreamChunk
+				ok    bool
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok = <-src:
+			}
+			if !ok {
+				if !forwarding {
+					payloadBytes := 0
+					for _, c := range buffered {
+						payloadBytes += len(c.Payload)
+					}
+					if payloadBytes == 0 {
+						// Zero-payload chunks are dropped downstream; a stream of only
+						// such chunks is an empty stream, not a successful completion.
+						_ = forward(coreexecutor.StreamChunk{Err: &coreauth.Error{
+							Code:      "empty_stream",
+							Message:   "upstream stream closed before first payload",
+							Retryable: true,
+						}})
+						return
+					}
+					// Judge with the incremental detector state instead of re-parsing
+					// the concatenated payload: separately chunked SSE frames do not
+					// reassemble into valid input for the payload-level check.
+					terminalEmpty := detector.Finish()
+					if terminalEmpty {
+						_ = forward(coreexecutor.StreamChunk{Err: coreauth.EmptyCompletionError()})
+						return
+					}
+				}
+				_ = flush()
+				return
+			}
+			if forwarding {
+				if !forward(chunk) {
+					return
+				}
+				if chunk.Err != nil {
+					return
+				}
+				continue
+			}
+
+			buffered = append(buffered, chunk)
+			if chunk.Err != nil {
+				// Before any semantic output, protocol framing is not client-visible.
+				// Surface the upstream failure first so the HTTP layer can still
+				// choose an error response instead of committing a successful stream.
+				buffered = buffered[:0]
+				forwarding = true
+				if !forward(chunk) {
+					return
+				}
+				return
+			}
+			if detector.Observe(chunk.Payload) {
+				forwarding = true
+				if !flush() {
+					return
+				}
+			}
+			if detector.IsTerminalEmpty() {
+				discardStreamChunks(ctx, src)
+				_ = forward(coreexecutor.StreamChunk{Err: coreauth.EmptyCompletionError()})
+				return
+			}
+		}
+	}()
+	return &coreexecutor.StreamResult{Chunks: wrapped, Headers: streamResult.Headers}
+}
+
+// streamDrainTimeout bounds how long an abandoned plugin upstream source is
+// drained while it produces nothing. A plugin that neither sends nor closes
+// would otherwise pin the drain goroutine and its connection for as long as
+// the request lives.
+//
+// This is not a timeout on any stream a caller reads: AGENTS.md:58 forbids
+// those after the upstream connection is established, and by the time this
+// budget starts the wrapper has already decided that not one byte of this
+// source will reach the client. It bounds cleanup, not delivery.
+const streamDrainTimeout = 5 * time.Second
+
+// discardStreamChunks drains an abandoned upstream source so its producer is
+// unblocked and its connection released, and returns a channel closed when the
+// drain is over. A bare `for range ch` is not enough: the wrapper abandons a
+// source it is still holding open (terminal empty), and an upstream that never
+// closes the channel would leak the goroutine forever.
+func discardStreamChunks(ctx context.Context, ch <-chan coreexecutor.StreamChunk) <-chan struct{} {
+	return drainStreamChunks(ctx, ch, streamDrainTimeout)
+}
+
+// drainStreamChunks is discardStreamChunks with an explicit idle budget. The
+// budget is a parameter rather than a mutable package variable so a caller that
+// needs a shorter one cannot race the drain goroutines already reading it.
+func drainStreamChunks(ctx context.Context, ch <-chan coreexecutor.StreamChunk, idleTimeout time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	if ch == nil {
+		close(done)
+		return done
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(idleTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				return
+			case _, ok := <-ch:
+				if !ok {
+					return
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(idleTimeout)
+			}
+		}
+	}()
+	return done
 }
 
 // CountPluginExecutor executes a count-tokens request with the named plugin executor without changing the requested model.
